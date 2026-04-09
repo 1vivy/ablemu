@@ -91,14 +91,18 @@ PROTOCOL_REGISTRY = {
     defines.EFI_RESETREASON_PROTOCOL_GUID: reset_reason_protocol,
 }
 
-def heap_alloc(size, alignment=16):
-    global _malloc_ptr, _malloc_map
-    allocated_addr = align_up(_malloc_ptr, alignment)
-    _malloc_ptr = allocated_addr + align_up(size, alignment)
-    if _malloc_ptr > defines.HEAP_BASE + defines.HEAP_SIZE:
-        return 0
-    _malloc_map[allocated_addr] = size
-    return allocated_addr
+def make_heap_alloc(mu):
+    def alloc(size, alignment=16):
+        global _malloc_ptr, _malloc_map
+        allocated_addr = align_up(_malloc_ptr, alignment)
+        _malloc_ptr = allocated_addr + align_up(size + 16, alignment)
+        if _malloc_ptr > defines.HEAP_BASE + defines.HEAP_SIZE:
+            return 0
+        _malloc_map[allocated_addr] = size
+        ensure_mapped(mu, allocated_addr + size, 16)
+        mu.mem_write(allocated_addr + size, b"\xAA" * 16)
+        return allocated_addr
+    return alloc
 
 # ---------------------------------------------------------------------------
 # Utility
@@ -229,7 +233,7 @@ def setup_uefi_tables(mu: Uc, chip_id: int, chip_version: int):
     graphics_output_protocol.setup(mu)
     simple_text_input_protocol.setup(mu)
     simple_text_output_protocol.setup(mu)
-    hii_font_protocol.setup(mu, allocator=heap_alloc)
+    hii_font_protocol.setup(mu, allocator=make_heap_alloc(mu))
     status_code_protocol.setup(mu, MOCK_REGION)
 
     # Add console handles and protocols to System Table
@@ -735,7 +739,7 @@ def hook_intr(mu: Uc, intno: int, user_data):
                 
                 # Allocate from heap, ensuring alignment
                 allocated_addr = align_up(_malloc_ptr, 16)  # 16-byte alignment
-                _malloc_ptr = allocated_addr + align_up(size, 16)
+                _malloc_ptr = allocated_addr + align_up(size + 16, 16)  # Extra 16 bytes for redzone
                 
                 # Check if we've exceeded heap bounds
                 if _malloc_ptr > defines.HEAP_BASE + defines.HEAP_SIZE:
@@ -745,6 +749,8 @@ def hook_intr(mu: Uc, intno: int, user_data):
                     _malloc_map[allocated_addr] = size
                     try:
                         mu.mem_write(buffer_ptr_addr, struct.pack("<Q", allocated_addr))
+                        ensure_mapped(mu, allocated_addr + size, 16)
+                        mu.mem_write(allocated_addr + size, b"\xAA" * 16)
                         print(f"       -> [AllocatePool] Allocated 0x{size:X} bytes at 0x{allocated_addr:X}")
                         ret_status = 0
                     except UcError as e:
@@ -755,6 +761,15 @@ def hook_intr(mu: Uc, intno: int, user_data):
                 buffer_addr = x0
                 if buffer_addr in _malloc_map:
                     size = _malloc_map[buffer_addr]
+                    
+                    try:
+                        redzone = mu.mem_read(buffer_addr + size, 16)
+                        if redzone != b"\xAA" * 16:
+                            print(f"[ERROR] [FreePool] HEAP BUFFER OVERFLOW DETECTED at 0x{buffer_addr:X}!")
+                            mu.emu_stop()
+                    except UcError:
+                        print(f"[ERROR] [FreePool] Could not read redzone at 0x{buffer_addr + size:X}")
+                        
                     del _malloc_map[buffer_addr]
                     print(f"       -> [FreePool] Freed 0x{size:X} bytes at 0x{buffer_addr:X}")
                     ret_status = 0
@@ -904,7 +919,7 @@ def hook_intr(mu: Uc, intno: int, user_data):
                     elif table_off == 0x138: # LocateHandleBuffer
                         proto = PROTOCOL_REGISTRY.get(guid_str.upper())
                         if proto:
-                            ret_status = proto.handle_locate_handle_buffer(mu, x4, x3, allocator=heap_alloc)
+                            ret_status = proto.handle_locate_handle_buffer(mu, x4, x3, allocator=make_heap_alloc(mu))
                         else:
                             print(f"       -> [LocateHandleBuffer] Protocol {guid_str} not in registry, returning EFI_NOT_FOUND.")
                             ret_status = 0x800000000000000E # EFI_NOT_FOUND
