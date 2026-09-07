@@ -19,7 +19,7 @@ MEDIA_DISK = 1
 
 fastboot_cmds = []
 reset_reason = 0
-
+video_output_path : str | None = None
 
 def feed_fastboot_cmd(cmd):
     fastboot_cmds.append(cmd)
@@ -27,6 +27,10 @@ def feed_fastboot_cmd(cmd):
 def set_reset_reason(reason):
     global reset_reason
     reset_reason = reason
+
+def set_video_output_path(path):
+    global video_output_path
+    video_output_path = path
 
 class Protocol():
     def __init__(self, guid=None):
@@ -1052,7 +1056,7 @@ class GraphicsOutputProtocol(Protocol):
 
         # 3. Setup EFI_GRAPHICS_OUTPUT_MODE_INFORMATION
         # Version, Horizontal, Vertical, PixelFormat, PixelInformation, PixelsPerScanLine
-        mu.mem_write(self.info_addr, struct.pack("<IIII", 0, 1024, 768, 1)) # PixelBlueGreenRedReserved8BitPerColor
+        mu.mem_write(self.info_addr, struct.pack("<IIII", 0, 1080, 2340, 1)) # PixelBlueGreenRedReserved8BitPerColor
         mu.mem_write(self.info_addr + 16, b"\x00" * 16) # PixelInformation (dummy mask)
         mu.mem_write(self.info_addr + 32, struct.pack("<I", 1024)) # PixelsPerScanLine
 
@@ -1076,7 +1080,64 @@ class GraphicsOutputProtocol(Protocol):
         gop_funcs = ["QueryMode", "SetMode", "Blt"]
         func_name = gop_funcs[func_idx] if func_idx < len(gop_funcs) else f"Unknown_GOP_Func_{func_idx}"
         
-        print(f"[UEFI] GraphicsOutput::{func_name} called")
+        lr = mu.reg_read(UC_ARM64_REG_LR)
+        print(f"[UEFI] GraphicsOutput::{func_name} called from {lr:X}")
+
+        if func_name == "QueryMode":
+            mode = mu.reg_read(UC_ARM64_REG_X1)
+            size = mu.reg_read(UC_ARM64_REG_X2)
+            ptr  = mu.reg_read(UC_ARM64_REG_X3)
+            print(f"  QueryMode: Mode={mode} Size={size} Ptr={ptr}")
+            mu.mem_write(ptr, struct.pack("<Q", self.info_addr))
+            mu.mem_write(size, struct.pack("<I", 36))
+        elif func_name == "Blt":
+            """
+                typedef
+                EFI_STATUS
+                (EFIAPI *EFI_GRAPHICS_OUTPUT_PROTOCOL_BLT) (
+                  IN  EFI_GRAPHICS_OUTPUT_PROTOCOL            *This,
+                  IN  EFI_GRAPHICS_OUTPUT_BLT_PIXEL           *BltBuffer,   OPTIONAL
+                  IN  EFI_GRAPHICS_OUTPUT_BLT_OPERATION       BltOperation,
+                  IN  UINTN                                   SourceX,
+                  IN  UINTN                                   SourceY,
+                  IN  UINTN                                   DestinationX,
+                  IN  UINTN                                   DestinationY,
+                  IN  UINTN                                   Width,
+                  IN  UINTN                                   Height,
+                  IN  UINTN                                   Delta         OPTIONAL
+                  );
+                typedef enum {
+                  EfiBltVideoFill,
+                  EfiBltVideoToBltBuffer,
+                  EfiBltBufferToVideo,
+                  EfiBltVideoToVideo,
+                  EfiGraphicsOutputBltOperationMax
+                } EFI_GRAPHICS_OUTPUT_BLT_OPERATION;
+                  """
+            buffer = mu.reg_read(UC_ARM64_REG_X1)
+            blt_op = mu.reg_read(UC_ARM64_REG_X2)
+            source_x  = mu.reg_read(UC_ARM64_REG_X3)
+            source_y  = mu.reg_read(UC_ARM64_REG_X4)
+            dest_x  = mu.reg_read(UC_ARM64_REG_X5)
+            dest_y  = mu.reg_read(UC_ARM64_REG_X6)
+            width  = mu.reg_read(UC_ARM64_REG_X7)
+            sp = mu.reg_read(UC_ARM64_REG_SP)
+            height  = struct.unpack("<I", mu.mem_read(sp, 4))[0]
+            delta  = struct.unpack("<I", mu.mem_read(sp + 8, 4))[0]
+            print(f"  Blt: buffer={buffer:X} op={blt_op} source=({source_x},{source_y}) dest=({dest_x},{dest_y}) wxh=({width},{height}) delta={delta}")
+            if blt_op == 2:
+                from PIL import Image
+                # EfiBltBufferToVideo
+                # Directly show buffer to video output
+                global video_output_path
+                if video_output_path != None:
+                    outbuf = mu.mem_read(buffer, width * height * 4)
+                    image = Image.frombytes("RGBA", (width, height), outbuf)
+
+                    image.save(video_output_path, "PNG")
+                    print(f"  Written video output to {video_output_path}: Size={width*height*4}")
+                else:
+                    print(f"  Skip video output: Size={width*height*4}. Use `--video-out output.png`.")
         
         # Default success return
         mu.reg_write(UC_ARM64_REG_X0, 0)

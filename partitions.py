@@ -3,6 +3,9 @@ import os
 
 class PartitionList:
     def __init__(self):
+        self.partition_list = []
+
+    def setup(self, fix):
         self.partition_list = [{"partition_name": "frp", "path": "frp.img"},
                                {"partition_name": "devinfo", "path": "devinfo.img"},
                                {"partition_name": "boot_a", "path": "boot.img"},
@@ -25,6 +28,9 @@ class PartitionList:
                                {"partition_name": "efisp_a", "path": "abl.pe"},
                                {"partition_name": "efisp", "path": "abl.pe"},
                                ]
+        if fix == defines.FIX_SAMSUNG:
+            self.partition_list.append({"partition_name": "param", "path": "param-samsung.img"})
+            self.partition_list.append({"partition_name": "debug", "path": "debug-samsung.img"})
 
         current_lba = 0
         for partition in self.partition_list:

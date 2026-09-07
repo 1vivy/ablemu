@@ -39,7 +39,7 @@ from protocols import (BlockIoProtocol,
   PlatformInfoProtocol,
   ResetReasonProtocol,
   feed_fastboot_cmd,
-  set_reset_reason)
+  set_reset_reason, set_video_output_path)
 from utils import align_up, allocate_mock, map_mock_base, ensure_mapped, call_dynamic_hook, guid_to_str, set_simple_hook
 from format_string import process_format_string
 from partitions import PartitionList
@@ -189,6 +189,9 @@ def setup_uefi_tables(mu: Uc, chip_id: int, chip_version: int):
     """
     global EFI_IMAGE_HANDLE, UEFI_STUB_REGION, MOCK_REGION, MOCK_FUNC_ADDR
     global MOCK_HANDLE_ARRAY_ADDR
+    global args
+
+    partition_list.setup(args.fix)
 
     # Map the entire MOCK region
     map_mock_base(mu)
@@ -388,7 +391,7 @@ def hook_code(mu: Uc, address: int, size: int, user_data):
     if _trace_enabled:
         code = mu.mem_read(address, size)
         insn_hex = struct.unpack("<I", code)[0]
-        print(f"  >>> 0x{address:016X}: {insn_hex:08X}")
+        #print(f"  >>> 0x{address:016X}: {insn_hex:08X}")
     elif _insn_count % 500_000 == 0:
         print(f"  ... {_insn_count} instructions executed  "
               f"(PC=0x{address:016X})")
@@ -605,6 +608,9 @@ def debug_prompt(mu: Uc, address: int):
             except (ValueError, IndexError):
                 print(f"  Invalid format: r <register>")
         
+        elif cmd == 'info':
+            dump_regs(mu)
+        
         elif cmd == 'h' or cmd == 'help':
             print(f"  Commands:")
             print(f"    (empty)     - Step to next instruction")
@@ -612,6 +618,7 @@ def debug_prompt(mu: Uc, address: int):
             print(f"    s/step      - Single step")
             print(f"    b <addr>    - Set breakpoint at address")
             print(f"    bl          - List all breakpoints")
+            print(f"    info        - Dump all registers")
             print(f"    bd <addr>   - Delete breakpoint at address")
             print(f"    x <addr> [sz] - Read memory at address")
             print(f"    r <reg>     - Read register value")
@@ -625,7 +632,7 @@ def hook_intr(mu: Uc, intno: int, user_data):
     global _malloc_ptr, _malloc_map
     """Interrupt / exception hook."""
     pc = mu.reg_read(UC_ARM64_REG_PC)
-    print(f"[INTR] Interrupt #{intno} at PC=0x{pc:016X}")  # Suppress verbose interrupt logging
+    #print(f"[INTR] Interrupt #{intno} at PC=0x{pc:016X}")  # Suppress verbose interrupt logging
     insn = struct.unpack("<I", mu.mem_read(pc, 4))[0]
 
     if intno == 2:
@@ -941,9 +948,16 @@ def hook_intr(mu: Uc, intno: int, user_data):
                 src = x1
                 size = x2
                 print(f"       -> [CopyMem] Copying {size} bytes from 0x{src:X} to 0x{dest:X}")
-                print(f"       -> [CopyMem] Data: {mu.mem_read(src, size).hex()[0:100]}")
-                mu.mem_write(dest, bytes(mu.mem_read(src, size)))
-                ret_status = 0
+                skip = False
+                if args.fix == defines.FIX_SAMSUNG:
+                    if src == 0x888200000:
+                        skip = True
+                        print(f"       -> [CopyMem] Skip Samsung sec log buf")
+                
+                if not skip:
+                    print(f"       -> [CopyMem] Data: {mu.mem_read(src, size).hex()[0:100]}")
+                    mu.mem_write(dest, bytes(mu.mem_read(src, size)))
+                ret_status = x0
             elif svc_type == 0 and table_off == 0x158: # CalculateCrc32
                 data = mu.mem_read(x0, x1)
                 crc = binascii.crc32(data)
@@ -957,7 +971,8 @@ def hook_intr(mu: Uc, intno: int, user_data):
             # Advance PC past BRK instruction to the RET instruction
             mu.reg_write(UC_ARM64_REG_PC, pc + 4)
         elif insn == 0xD4200040: # BRK #2 (Generic Mock Protocol Method Return)
-            print("[EMU]  Generic Mock Protocol Method called, returning EFI_SUCCESS.")
+            lr = mu.reg_read(UC_ARM64_REG_LR)
+            print(f"[EMU]  Generic Mock Protocol Method called, returning EFI_SUCCESS. Called from {lr:X}")
             # Return EFI_SUCCESS in X0
             mu.reg_write(UC_ARM64_REG_X0, 0)
             # Advance PC past BRK instruction to the RET instruction
@@ -1080,7 +1095,7 @@ def dump_regs(mu: Uc):
     pc = mu.reg_read(UC_ARM64_REG_PC)
     sp = mu.reg_read(UC_ARM64_REG_SP)
     lr = mu.reg_read(UC_ARM64_REG_LR)
-    print(f"  PC =0x{pc:016X}  SP =0x{sp:016X}  LR =0x{lr:016X}")
+    print(f"  PC =0x{pc:016X}    SP =0x{sp:016X}    LR =0x{lr:016X}")
     print("=========================\n")
 
 
@@ -1103,7 +1118,7 @@ def dump_stack_trace(mu: Uc):
     
     # Align SP to 8 bytes and scan upwards towards STACK_BASE
     current_addr = sp & ~7
-    while current_addr < STACK_BASE:
+    while current_addr < defines.STACK_BASE:
         try:
             val = struct.unpack("<Q", mu.mem_read(current_addr, 8))[0]
             # If the value on the stack points to our PE code section, it's highly likely a return address!
@@ -1151,11 +1166,15 @@ def main():
     parser.add_argument("--chip-id", type=int, default=0x26a, help="Chip ID")
     parser.add_argument("--chip-version", type=int, default=0x10000, help="Chip version")
     parser.add_argument("--reset-reason", type=int, default=0x0, help="Reset reason. 0: Normal, 1: Recovery, 2: Fastboot, ...")
+    parser.add_argument("--fix", type=int, default=0x0, help="Fix for specific device or version. 0: No, 1: Samsung")
+    parser.add_argument("--video-out", type=str, default=None, help="Output path of png file of video output")
     args = parser.parse_args()
 
     if args.feed_cmd:
         for cmd in args.feed_cmd:
             feed_fastboot_cmd(cmd)
+
+    set_video_output_path(args.video_out)
 
     pe_data = extract_pe(args.pe)
     print(f"[*] Trace mode: {'ON' if _trace_enabled else 'OFF'}  "
@@ -1299,6 +1318,40 @@ def main():
     hook_addr = image_base + 0x15EC
     #mu.hook_add(UC_HOOK_CODE, hook_log_15ec, begin=hook_addr, end=hook_addr)
 
+    if args.fix == defines.FIX_SAMSUNG:
+        # Workaround. Samsung Galaxy S26 ABL accesses 0xc221000 for some timer.
+        mu.mem_map(0xc221000, 0x1000, UC_PROT_ALL)
+
+        def hook_zero_mem(mu: Uc, address: int, size: int, user_data):
+            x0 = mu.reg_read(UC_ARM64_REG_X0)
+            x1 = mu.reg_read(UC_ARM64_REG_X1)
+            lr = mu.reg_read(UC_ARM64_REG_LR)
+            #print(f"ZeroMem: Called from {lr:X} x0: {x0:X} x1: {x1:X}")
+            mu.mem_write(x0, bytes(x1))
+            mu.reg_write(UC_ARM64_REG_PC, 0x6f08)
+
+        mu.hook_add(UC_HOOK_CODE, hook_zero_mem, begin=0x6e6c, end=0x6e6c)
+
+        traces = [0x11644, 0x3fd4, 0x76000]
+        for trace in traces:
+            def samsung_test_hook1(mu: Uc, address: int, size: int, user_data):
+                x0 = mu.reg_read(UC_ARM64_REG_X0)
+                x1 = mu.reg_read(UC_ARM64_REG_X1)
+                lr = mu.reg_read(UC_ARM64_REG_LR)
+                print(f"Samsung test hook {trace:X}: Called from {lr:X} x0: {x0:X} x1: {x1:X}")
+
+            mu.hook_add(UC_HOOK_CODE, samsung_test_hook1, begin=trace, end=trace)
+
+        mem_addr = 0x17b990
+        def samsung_mem_hook(uc, access, address, size, value, user_data):
+            if address == mem_addr:
+                print(f"Mem hook:")
+                print(f"    addr : 0x{address:X}")
+                print(f"    size: {size} B")
+                print(f"    value: 0x{value:X}")
+
+        mu.hook_add(UC_HOOK_MEM_WRITE, samsung_mem_hook, begin=mem_addr)
+
     def hook_getblkiohandles(mu: Uc, address: int, size: int, user_data):
         x0 = mu.reg_read(UC_ARM64_REG_X0)  # SelectionAttrib
         x1 = mu.reg_read(UC_ARM64_REG_X1)  # FilterData pointer
@@ -1391,9 +1444,12 @@ def main():
             except UcError:
                 print(f"       FilterData: <unreadable>")
 
-    getblkiohandles_addr = image_base + 0xADB4
+    if args.fix == defines.FIX_SAMSUNG:
+        getblkiohandles_addr = image_base + 0x11a5c
+    else:
+        getblkiohandles_addr = image_base + 0xADB4
     mu.hook_add(UC_HOOK_CODE, hook_getblkiohandles, begin=getblkiohandles_addr, end=getblkiohandles_addr)
-    mu.hook_add(UC_HOOK_CODE, hook_getblkiohandles, begin=0x000149c0, end=0x000149c0)
+    #mu.hook_add(UC_HOOK_CODE, hook_getblkiohandles, begin=0x000149c0, end=0x000149c0)
 
     #mu.hook_add(UC_HOOK_CODE, hook_code, begin=STRNCMP_ADDR, end=STRNCMP_ADDR)
 

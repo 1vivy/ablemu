@@ -6,5 +6,6 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "pefile>=2024.8.26",
+    "pillow>=12.3.0",
     "unicorn>=2.1.4",
 ]
