@@ -38,8 +38,9 @@ from protocols import (BlockIoProtocol,
   ChipInfoProtocol,
   PlatformInfoProtocol,
   ResetReasonProtocol,
+  SamsungFuelGaugeProtocol,
   feed_fastboot_cmd,
-  set_reset_reason, set_video_output_path)
+  set_reset_reason, set_video_output_dir)
 from utils import align_up, allocate_mock, map_mock_base, ensure_mapped, call_dynamic_hook, guid_to_str, set_simple_hook
 from format_string import process_format_string
 from partitions import PartitionList
@@ -67,6 +68,7 @@ qcom_scm_protocol = QcomScmProtocol()
 chip_info_protocol = ChipInfoProtocol()
 platform_info_protocol = PlatformInfoProtocol()
 reset_reason_protocol = ResetReasonProtocol()
+samsung_fuel_gauge_protocol = SamsungFuelGaugeProtocol()
 
 # Registry for protocol lookups
 PROTOCOL_REGISTRY = {
@@ -89,6 +91,7 @@ PROTOCOL_REGISTRY = {
     defines.EFI_CHIPINFO_PROTOCOL_GUID: chip_info_protocol,
     defines.EFI_PLATFORMINFO_PROTOCOL_GUID: platform_info_protocol,
     defines.EFI_RESETREASON_PROTOCOL_GUID: reset_reason_protocol,
+    defines.SAMSUNG_FUEL_GAUGE_PROTOCOL_GUID: samsung_fuel_gauge_protocol,
 }
 
 def make_heap_alloc(mu):
@@ -335,6 +338,7 @@ def setup_uefi_tables(mu: Uc, chip_id: int, chip_version: int):
     chip_info_protocol.setup(mu, chip_id, chip_version)
     platform_info_protocol.setup(mu)
     reset_reason_protocol.setup(mu)
+    samsung_fuel_gauge_protocol.setup(mu)
 
 # Area for BootServices / RuntimeServices function names
 EFI_BOOT_SERVICES_NAMES = {
@@ -1167,14 +1171,15 @@ def main():
     parser.add_argument("--chip-version", type=int, default=0x10000, help="Chip version")
     parser.add_argument("--reset-reason", type=int, default=0x0, help="Reset reason. 0: Normal, 1: Recovery, 2: Fastboot, ...")
     parser.add_argument("--fix", type=int, default=0x0, help="Fix for specific device or version. 0: No, 1: Samsung")
-    parser.add_argument("--video-out", type=str, default=None, help="Output path of png file of video output")
+    parser.add_argument("--video-out-dir", type=str, default=None, help="Output directory of video output")
+    parser.add_argument("--qfprom", type=str, default=None, help="qfprom image file.")
     args = parser.parse_args()
 
     if args.feed_cmd:
         for cmd in args.feed_cmd:
             feed_fastboot_cmd(cmd)
 
-    set_video_output_path(args.video_out)
+    set_video_output_dir(args.video_out_dir)
 
     pe_data = extract_pe(args.pe)
     print(f"[*] Trace mode: {'ON' if _trace_enabled else 'OFF'}  "
@@ -1322,6 +1327,26 @@ def main():
         # Workaround. Samsung Galaxy S26 ABL accesses 0xc221000 for some timer.
         mu.mem_map(0xc221000, 0x1000, UC_PROT_ALL)
 
+        # Samsung access qfprom directly from LinuxLoader.
+        QFPROM_ADDR = 0x221c8000
+        QFPROM_LEN = 0x1000
+        mu.mem_map(QFPROM_ADDR, QFPROM_LEN, UC_PROT_ALL)
+        if args.qfprom != None:
+            qfprom_img = open(args.qfprom, "rb").read()
+            if len(qfprom_img) != QFPROM_LEN:
+                print(f"WARNING: QFPROM Size is not valid.")
+            mu.mem_write(QFPROM_ADDR, qfprom_img)
+
+        def qfprom_hook(uc, access, address, size, value, user_data):
+            read_value = mu.mem_read(address, size)
+            print(f"QFPROM Read: address={address:X} size={size} bytes value={binascii.hexlify(read_value)}")
+        mu.hook_add(UC_HOOK_MEM_READ, qfprom_hook, begin=QFPROM_ADDR, end=QFPROM_ADDR + QFPROM_LEN)
+
+        # 0x00000000221C397C is also qfprom?
+        QFPROM2_ADDR = 0x221c3000
+        QFPROM2_LEN = 0x1000
+        mu.mem_map(QFPROM2_ADDR, QFPROM2_LEN, UC_PROT_ALL)
+
         def hook_zero_mem(mu: Uc, address: int, size: int, user_data):
             x0 = mu.reg_read(UC_ARM64_REG_X0)
             x1 = mu.reg_read(UC_ARM64_REG_X1)
@@ -1337,8 +1362,9 @@ def main():
             def samsung_test_hook1(mu: Uc, address: int, size: int, user_data):
                 x0 = mu.reg_read(UC_ARM64_REG_X0)
                 x1 = mu.reg_read(UC_ARM64_REG_X1)
+                x2 = mu.reg_read(UC_ARM64_REG_X1)
                 lr = mu.reg_read(UC_ARM64_REG_LR)
-                print(f"Samsung test hook {trace:X}: Called from {lr:X} x0: {x0:X} x1: {x1:X}")
+                print(f"Samsung test hook {address:X}: Called from {lr:X} x0: {x0:X} x1: {x1:X} x2: {x2:X}")
 
             mu.hook_add(UC_HOOK_CODE, samsung_test_hook1, begin=trace, end=trace)
 

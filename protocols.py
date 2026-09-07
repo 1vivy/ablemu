@@ -19,7 +19,8 @@ MEDIA_DISK = 1
 
 fastboot_cmds = []
 reset_reason = 0
-video_output_path : str | None = None
+video_output_dir : str | None = None
+next_video_index : int = 0
 
 def feed_fastboot_cmd(cmd):
     fastboot_cmds.append(cmd)
@@ -28,9 +29,9 @@ def set_reset_reason(reason):
     global reset_reason
     reset_reason = reason
 
-def set_video_output_path(path):
-    global video_output_path
-    video_output_path = path
+def set_video_output_dir(path):
+    global video_output_dir
+    video_output_dir = path
 
 class Protocol():
     def __init__(self, guid=None):
@@ -1076,6 +1077,7 @@ class GraphicsOutputProtocol(Protocol):
         return 0
 
     def handle_call(self, mu, pc):
+        global next_video_index, video_output_dir
         func_idx = mu.reg_read(UC_ARM64_REG_X16)
         gop_funcs = ["QueryMode", "SetMode", "Blt"]
         func_name = gop_funcs[func_idx] if func_idx < len(gop_funcs) else f"Unknown_GOP_Func_{func_idx}"
@@ -1129,15 +1131,17 @@ class GraphicsOutputProtocol(Protocol):
                 from PIL import Image
                 # EfiBltBufferToVideo
                 # Directly show buffer to video output
-                global video_output_path
-                if video_output_path != None:
+                global video_output_dir
+                if video_output_dir != None:
                     outbuf = mu.mem_read(buffer, width * height * 4)
                     image = Image.frombytes("RGBA", (width, height), outbuf)
 
-                    image.save(video_output_path, "PNG")
-                    print(f"  Written video output to {video_output_path}: Size={width*height*4}")
+                    path = os.path.join(video_output_dir, str(next_video_index) + ".png")
+                    image.save(path, "PNG")
+                    next_video_index += 1
+                    print(f"  Written video output to {path}: Size={width*height*4}")
                 else:
-                    print(f"  Skip video output: Size={width*height*4}. Use `--video-out output.png`.")
+                    print(f"  Skip video output: Size={width*height*4}. Use `--video-out-dir output-dir`.")
         
         # Default success return
         mu.reg_write(UC_ARM64_REG_X0, 0)
@@ -1621,6 +1625,12 @@ class QcomScmProtocol(Protocol):
 
             if smc_id == self.TZ_INFO_GET_SECURE_STATE:
                 mu.mem_write(results_ptr, struct.pack("<QQQ", 1, 1 << self.DEBUG_RE_ENABLED_FUSE, 0))
+            elif smc_id == 0x200020F:
+                # GetAntirollback
+                param1 = struct.unpack("<Q", mu.mem_read(parameters_ptr, 8))[0]
+                print(f"       -> [QCOM_SCM] GetAntirollback : 0x{param1:X}")
+                # echo back param
+                mu.mem_write(results_ptr, struct.pack("<QQ", 1, param1))
             else:
                 print(f"       -> [QCOM_SCM] Unknown SMC ID: 0x{smc_id:X}")
 
@@ -1860,3 +1870,43 @@ typedef enum {
         else:
             print(f"       -> [ResetReason] Unknown function: {func_name}")
             mu.reg_write(UC_ARM64_REG_X0, 0)
+
+class SamsungFuelGaugeProtocol(Protocol):
+    def __init__(self):
+        super().__init__(defines.SAMSUNG_FUEL_GAUGE_PROTOCOL_GUID)
+        self.addr = 0
+        self.stubs_addr = 0
+        self.allocator = None
+
+        self.funcs_offset = 0
+        self.funcs = [f"Unknown{i:X}" for i in range(0x100 // 8)]
+        self.funcs[0x68 // 8] = "FgGetVoltage"
+        self.funcs[0x70 // 8] = "FgGetSoc"
+        self.funcs[0x90 // 8] = "GetBattTemp"
+        self.funcs[0xB0 // 8] = "FuelgaugeInit"
+
+    def setup(self, mu):
+        self.generate_hook_funcs(mu, b"")
+
+    def handle_hook(self, mu, func_idx):
+        global reset_reason
+        func_name = self.funcs[func_idx]
+        print(f"       -> [SamsungFuelGaugeProtocol] {func_name}")
+        
+        if func_name == "FgGetVoltage":
+            voltage = mu.reg_read(UC_ARM64_REG_X0)
+            mu.mem_write(voltage, struct.pack("<Q", 4300))
+            mu.reg_write(UC_ARM64_REG_X0, 0)
+        elif func_name == "FgGetSoc":
+            voltage = mu.reg_read(UC_ARM64_REG_X0)
+            mu.mem_write(voltage, struct.pack("<Q", 78))
+            mu.reg_write(UC_ARM64_REG_X0, 0)
+        elif func_name == "GetBattTemp":
+            voltage = mu.reg_read(UC_ARM64_REG_X0)
+            mu.mem_write(voltage, struct.pack("<Q", 30))
+            mu.reg_write(UC_ARM64_REG_X0, 0)
+        elif func_name == "FuelgaugeInit":
+            mu.reg_write(UC_ARM64_REG_X0, 0)
+        else:
+            mu.reg_write(UC_ARM64_REG_X0, 0)
+
