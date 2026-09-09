@@ -3,7 +3,7 @@ import os
 from unicorn.arm64_const import *
 from unicorn import UcError
 from utils import (align_up, allocate_mock, allocate_mock_bytes,
-ensure_mapped, register_dynamic_hook, read_string, hexdump, guid_to_str)
+ensure_mapped, read_string16, register_dynamic_hook, read_string, hexdump, guid_to_str)
 from format_string import process_format_string
 import defines
 import queue
@@ -21,6 +21,7 @@ fastboot_cmds = []
 reset_reason = 0
 video_output_dir : str | None = None
 next_video_index : int = 0
+devinfo_path : str = "devinfo.img"
 
 def feed_fastboot_cmd(cmd):
     fastboot_cmds.append(cmd)
@@ -32,6 +33,12 @@ def set_reset_reason(reason):
 def set_video_output_dir(path):
     global video_output_dir
     video_output_dir = path
+
+def set_args(args):
+    global devinfo_path
+    if args.devinfo_path != None:
+        devinfo_path = args.devinfo_path
+
 
 class Protocol():
     def __init__(self, guid=None):
@@ -84,9 +91,33 @@ class BlockIoProtocol(Protocol):
         self.protocols_addr = []
         self.read_stub_addr = 0
         self.partition_list = partition_list
-        
+        self.funcs = ["Reset", "ReadBlocks", "WriteBlocks", "FlushBlocks"]
+
     def setup(self, mu, mock_func_addr):
         """Setup EFI_BLOCK_IO_PROTOCOL for disk, devinfo, and frp partitions."""
+        """
+///
+///  This protocol provides control over block devices.
+///
+struct _EFI_BLOCK_IO_PROTOCOL {
+  ///
+  /// The revision to which the block IO interface adheres. All future
+  /// revisions must be backwards compatible. If a future version is not
+  /// back wards compatible, it is not the same GUID.
+  ///
+  UINT64              Revision;
+  ///
+  /// Pointer to the EFI_BLOCK_IO_MEDIA data for this device.
+  ///
+  EFI_BLOCK_IO_MEDIA  *Media;
+
+  EFI_BLOCK_RESET     Reset;
+  EFI_BLOCK_READ      ReadBlocks;
+  EFI_BLOCK_WRITE     WriteBlocks;
+  EFI_BLOCK_FLUSH     FlushBlocks;
+
+};
+        """
         self.protocol_disk_addr = allocate_mock(0x80)
         self.media_disk_addr = allocate_mock(0x80)
 
@@ -98,7 +129,7 @@ class BlockIoProtocol(Protocol):
         # Write a custom stub for ReadBlocks (BRK #5)
         # BRK #5 (0xD42000A0), RET (0xD65F03C0)
         mu.mem_write(self.read_stub_addr, struct.pack("<II", 0xD42000A0, 0xD65F03C0))
-        
+
         # Setup EFI_BLOCK_IO_MEDIA for disk, devinfo, and frp partitions
         # Disk (entire device) - Media ID 1
         disk_media_data = struct.pack("<IbbbbbxxxIIxxxxQQII", MEDIA_DISK, 0, 1, 0, 0, 0, defines.BLOCK_SIZE, 1, self.partition_list.total_lba - 1, 0, 1, 1)
@@ -109,12 +140,21 @@ class BlockIoProtocol(Protocol):
             mu.mem_write(self.medias_addr[i], devinfo_media_data)
             
         # Setup EFI_BLOCK_IO_PROTOCOL for disk
-        disk_proto_data = struct.pack("<QQQQQQ", 0x0000000000010000, self.media_disk_addr, mock_func_addr, self.read_stub_addr, mock_func_addr, mock_func_addr)
-        mu.mem_write(self.protocol_disk_addr, disk_proto_data)
+        prefix = struct.pack("<QQ", 0x0000000000010000, self.media_disk_addr)
+        self.addr = allocate_mock(len(prefix) + 8 * len(self.funcs))
+        self.stub_addr = allocate_mock(8 * len(self.funcs))
+        
+        mu.mem_write(self.addr, prefix)
+        
+        for i in range(len(self.funcs)):
+            stub_addr = self.stub_addr + (i * 8)
+            register_dynamic_hook(stub_addr, self, i)
+            mu.mem_write(stub_addr, defines.DYNAMIC_HOOK_STUB)
+            mu.mem_write(self.addr + len(prefix) + (i * 8), struct.pack("<Q", stub_addr))
         
         for i, partition in enumerate(self.partition_list):
             # Setup EFI_BLOCK_IO_PROTOCOL for partitions
-            proto_data = struct.pack("<QQQQQQ", 0x0000000000010000, self.medias_addr[i], mock_func_addr, self.read_stub_addr, mock_func_addr, mock_func_addr)
+            proto_data = struct.pack("<QQQQQQ", 0x0000000000010000, self.medias_addr[i], self.stub_addr, self.stub_addr + 8, self.stub_addr + 0x10, self.stub_addr + 0x18)
             mu.mem_write(self.protocols_addr[i], proto_data)
 
     def handle_locate_handle_buffer(self, mu, buffer_ptr_ptr_addr, count_ptr_addr, allocator=None):
@@ -156,8 +196,20 @@ class BlockIoProtocol(Protocol):
         mu.mem_write(interface_ptr_ptr_addr, struct.pack("<Q", blockio_addr))
         return 0
 
+    def handle_hook(self, mu, func_idx):
+        global reset_reason
+        func_name = self.funcs[func_idx]
+        print(f"[UEFI] BlockIoProtocol::{func_name}")
+        
+        if func_name == "ReadBlocks":
+            self.handle_read_blocks(mu)
+        elif func_name == "WriteBlocks":
+            self.handle_write_blocks(mu)
+        else:
+            mu.reg_write(UC_ARM64_REG_X0, 0)
+
+
     def handle_read_blocks(self, mu):
-        """Implementation of BlockIo.ReadBlocks (BRK #5)."""
         # Args: X0 = This, X1 = MediaId, X2 = LBA, X3 = BufferSize, X4 = Buffer
         this_ptr = mu.reg_read(UC_ARM64_REG_X0)
         media_id = mu.reg_read(UC_ARM64_REG_X1)
@@ -165,7 +217,7 @@ class BlockIoProtocol(Protocol):
         buf_size = mu.reg_read(UC_ARM64_REG_X3)
         buf_ptr  = mu.reg_read(UC_ARM64_REG_X4)
         
-        print(f"[UEFI] BlockIo::ReadBlocks | MediaId: {media_id}, LBA: 0x{lba:X}, Size: 0x{buf_size:X} into 0x{buf_ptr:X}")
+        print(f"         -> ReadBlocks | MediaId: {media_id}, LBA: 0x{lba:X}, Size: 0x{buf_size:X} into 0x{buf_ptr:X}")
         try:
             if media_id == MEDIA_DISK:
                 print("Warning: Disk whole partition read is not supported.")
@@ -198,6 +250,44 @@ class BlockIoProtocol(Protocol):
             pass
         
         # Return EFI_SUCCESS (0) in X0
+        mu.reg_write(UC_ARM64_REG_X0, 0)
+
+    def handle_write_blocks(self, mu):
+        """
+            typedef
+            EFI_STATUS
+            (EFIAPI *EFI_BLOCK_WRITE)(
+              IN EFI_BLOCK_IO_PROTOCOL          *This,
+              IN UINT32                         MediaId,
+              IN EFI_LBA                        Lba,
+              IN UINTN                          BufferSize,
+              IN VOID                           *Buffer
+              );
+        """
+        # Args: X0 = This, X1 = MediaId, X2 = LBA, X3 = BufferSize, X4 = Buffer
+        this_ptr = mu.reg_read(UC_ARM64_REG_X0)
+        media_id = mu.reg_read(UC_ARM64_REG_X1)
+        lba      = mu.reg_read(UC_ARM64_REG_X2)
+        buf_size = mu.reg_read(UC_ARM64_REG_X3)
+        buf_ptr  = mu.reg_read(UC_ARM64_REG_X4)
+        
+        print(f"         -> WriteBlocks | MediaId: {media_id}, LBA: 0x{lba:X}, Size: 0x{buf_size:X} from 0x{buf_ptr:X}")
+        print(f"Warning: WriteBlocks is not implemented\n")
+
+        offset = lba * defines.BLOCK_SIZE
+        if media_id == MEDIA_DISK:
+            print("Warning: Disk whole partition read is not supported.")
+            print(f"Write Whole disk: 0x{offset:X}")
+            mu.reg_write(UC_ARM64_REG_X0, 0)
+        else:
+            partition_index = media_id - 2
+            path = self.partition_list[partition_index]["path"]
+            name = self.partition_list[partition_index]["partition_name"]
+            print(f"WritePartition: {name} {path}@0x{offset:X}")
+
+        buf = mu.mem_read(buf_ptr, buf_size)
+        #hexdump(buf)
+        
         mu.reg_write(UC_ARM64_REG_X0, 0)
 
 class DevicePathProtocol(Protocol):
@@ -388,7 +478,7 @@ class VerifiedBootProtocol(Protocol):
             
             # Enum vb_device_state_op_t: 0=READ_CONFIG, 1=WRITE_CONFIG
             if op_type == 0: # READ_CONFIG
-                devinfo_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "devinfo.img")
+                global devinfo_path
                 if os.path.isfile(devinfo_path):
                     try:
                         with open(devinfo_path, "rb") as f:
@@ -411,6 +501,9 @@ class VerifiedBootProtocol(Protocol):
                         pass
             elif op_type == 1: # WRITE_CONFIG
                 print(f"       -> [VBRwDeviceState] Ignored write to devinfo (len={buf_len})")
+                buf = mu.mem_read(buf_ptr, buf_len)
+                hexdump(buf)
+                #open("devinfo-write.img", "wb").write(buf)
         elif func_name == "VBIsDeviceSecure":
             buf_ptr = x1
             mu.mem_write(buf_ptr, struct.pack("<Q", 1))
@@ -1089,7 +1182,7 @@ class GraphicsOutputProtocol(Protocol):
             mode = mu.reg_read(UC_ARM64_REG_X1)
             size = mu.reg_read(UC_ARM64_REG_X2)
             ptr  = mu.reg_read(UC_ARM64_REG_X3)
-            print(f"  QueryMode: Mode={mode} Size={size} Ptr={ptr}")
+            print(f"  QueryMode: Mode={mode}")
             mu.mem_write(ptr, struct.pack("<Q", self.info_addr))
             mu.mem_write(size, struct.pack("<I", 36))
         elif func_name == "Blt":
@@ -1127,7 +1220,11 @@ class GraphicsOutputProtocol(Protocol):
             height  = struct.unpack("<I", mu.mem_read(sp, 4))[0]
             delta  = struct.unpack("<I", mu.mem_read(sp + 8, 4))[0]
             print(f"  Blt: buffer={buffer:X} op={blt_op} source=({source_x},{source_y}) dest=({dest_x},{dest_y}) wxh=({width},{height}) delta={delta}")
-            if blt_op == 2:
+            if blt_op == 0:
+                buf = mu.mem_read(buffer, 4)
+                color = struct.unpack("<I", buf)[0]
+                print(f"  Fill solid: {color:X}")
+            elif blt_op == 2:
                 from PIL import Image
                 # EfiBltBufferToVideo
                 # Directly show buffer to video output
@@ -1197,6 +1294,31 @@ class SimpleTextInputProtocol(Protocol):
             mu.reg_write(UC_ARM64_REG_X0, 0x8000000000000006)
         else:
             mu.reg_write(UC_ARM64_REG_X0, 0)
+
+class SimpleTextInputExProtocol(Protocol):
+    def __init__(self):
+        super().__init__(defines.EFI_SIMPLE_TEXT_INPUT_EX_PROTOCOL_GUID)
+        self.addr = 0
+        self.stubs_addr = 0
+        self.allocator = None
+
+        self.funcs_offset = 0
+
+        self.funcs = ["Reset", "ReadKeyStrokeEx", "WaitForKeyEx", "SetState", "RegisterKeyNotify", "UnregisterKeyNotify"]
+
+    def setup(self, mu):
+        self.generate_hook_funcs(mu, b"")
+
+    def handle_hook(self, mu, func_idx):
+        global reset_reason
+        func_name = self.funcs[func_idx]
+        print(f"       -> [SimpleTextInputExProtocol] {func_name}")
+        
+        if func_name == "ReadKeyStrokeEx":
+            mu.reg_write(UC_ARM64_REG_X0, 0)
+        else:
+            mu.reg_write(UC_ARM64_REG_X0, 0)
+
 
 class SimpleTextOutputProtocol(Protocol):
     def __init__(self):
@@ -1497,7 +1619,14 @@ class QSEEComProtocol(Protocol):
     def handle_hook(self, mu, func_idx):
         func_name = self.funcs[func_idx]
         if func_name == "QseecomStartApp":
-            print(f"       -> [QSEECom] QseecomStartApp called: {read_string(mu, mu.reg_read(UC_ARM64_REG_X1))}")
+            app_name = read_string(mu, mu.reg_read(UC_ARM64_REG_X1))
+            app_id_ptr = mu.reg_read(UC_ARM64_REG_X2)
+            app_id = 0
+            if app_name == "bksecapp_a":
+                app_id = 1
+            mu.mem_write(app_id_ptr, struct.pack("<I", app_id))
+
+            print(f"       -> [QSEECom] QseecomStartApp called: {app_name} app_id: {app_id}")
             mu.reg_write(UC_ARM64_REG_X0, 0)
         elif func_name == "QseecomShutdownApp":
             print(f"       -> [QSEECom] QseecomShutdownApp called")
@@ -1565,6 +1694,7 @@ class QcomScmProtocol(Protocol):
     
     TZ_INFO_GET_SECURE_STATE = 0x2000604
     DEBUG_RE_ENABLED_FUSE = 6
+    TZ_INFO_GET_FEATURE_VERSION_ID = 0x2000603
 
     def setup(self, mu):
         self.addr = allocate_mock(0x80)
@@ -1625,6 +1755,8 @@ class QcomScmProtocol(Protocol):
 
             if smc_id == self.TZ_INFO_GET_SECURE_STATE:
                 mu.mem_write(results_ptr, struct.pack("<QQQ", 1, 1 << self.DEBUG_RE_ENABLED_FUSE, 0))
+            elif smc_id == self.TZ_INFO_GET_FEATURE_VERSION_ID:
+                mu.mem_write(results_ptr, struct.pack("<QQQ", 1, 3 << 23, 0))
             elif smc_id == 0x200020F:
                 # GetAntirollback
                 param1 = struct.unpack("<Q", mu.mem_read(parameters_ptr, 8))[0]
@@ -1910,3 +2042,30 @@ class SamsungFuelGaugeProtocol(Protocol):
         else:
             mu.reg_write(UC_ARM64_REG_X0, 0)
 
+class EfiPilProtocol(Protocol):
+    def __init__(self):
+        super().__init__(defines.SAMSUNG_FUEL_GAUGE_PROTOCOL_GUID)
+        self.addr = 0
+        self.stubs_addr = 0
+        self.allocator = None
+
+        self.funcs_offset = 0
+        self.funcs = [f"Unknown{i:X}" for i in range(0x100 // 8)]
+        self.funcs[0x8 // 8] = "ProcessPilImage"
+
+    def setup(self, mu):
+        self.generate_hook_funcs(mu, b"")
+
+    def handle_hook(self, mu, func_idx):
+        global reset_reason
+        func_name = self.funcs[func_idx]
+        print(f"       -> [EfiPilProtocol] {func_name}")
+        
+        if func_name == "ProcessPilImage":
+            image_name = mu.reg_read(UC_ARM64_REG_X0)
+            image_name_str = read_string16(mu, image_name)
+            print(f"           ProcessPilImage: {image_name_str}")
+
+            mu.reg_write(UC_ARM64_REG_X0, 0)
+        else:
+            mu.reg_write(UC_ARM64_REG_X0, 0)

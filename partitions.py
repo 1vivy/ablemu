@@ -6,38 +6,46 @@ class PartitionList:
         self.partition_list = []
 
     def setup(self, fix):
-        self.partition_list = [{"partition_name": "frp", "path": "frp.img"},
-                               {"partition_name": "devinfo", "path": "devinfo.img"},
-                               {"partition_name": "boot_a", "path": "boot.img"},
-                               {"partition_name": "boot_b", "path": "boot.img"},
-                               {"partition_name": "system_a", "path": "system.img"},
-                               {"partition_name": "abl_a", "path": "system.img"},
-                               {"partition_name": "abl_b", "path": "system.img"},
-                               {"partition_name": "dtbo_a", "path": "dtbo.img"},
-                               {"partition_name": "dtbo_b", "path": "dtbo.img"},
-                               {"partition_name": "vbmeta_a", "path": "vbmeta.img"},
-                               {"partition_name": "vbmeta_b", "path": "vbmeta.img"},
-                               {"partition_name": "vendor_boot_a", "path": "vendor_boot.img"},
-                               {"partition_name": "vendor_boot_b", "path": "vendor_boot.img"},
-                               {"partition_name": "vbmeta_system_a", "path": "vbmeta_system.img"},
-                               {"partition_name": "vbmeta_system_b", "path": "vbmeta_system.img"},
-                               {"partition_name": "recovery_a", "path": "recovery.img"},
-                               {"partition_name": "recovery_b", "path": "recovery.img"},
-                               {"partition_name": "init_boot_a", "path": "init_boot.img"},
-                               {"partition_name": "init_boot_b", "path": "init_boot.img"},
+        d = "samsung-imgs/"
+        self.partition_list = [
+                               #{"partition_name": "frp", "path": "frp.img"},
+                               #{"partition_name": "devinfo", "path": "devinfo.img"},
+                               {"partition_name": "boot_a", "path": d + "boot.img"},
+                               {"partition_name": "boot_b", "path": d + "boot.img"},
+                               #{"partition_name": "system_a", "path": d + "system.img"},
+                               {"partition_name": "abl_a", "path": d + "abl.elf"},
+                               {"partition_name": "abl_b", "path": d + "abl.elf"},
+                               {"partition_name": "dtbo_a", "path": d + "dtbo.img"},
+                               {"partition_name": "dtbo_b", "path": d + "dtbo.img"},
+                               {"partition_name": "vbmeta_a", "path": d + "vbmeta.img"},
+                               {"partition_name": "vbmeta_b", "path": d + "vbmeta.img"},
+                               {"partition_name": "vendor_boot_a", "path": d + "vendor_boot.img"},
+                               {"partition_name": "vendor_boot_b", "path": d + "vendor_boot.img"},
+                               {"partition_name": "vbmeta_system_a", "path": d + "vbmeta_system.img"},
+                               {"partition_name": "vbmeta_system_b", "path": d + "vbmeta_system.img"},
+                               # {"partition_name": "recovery_a", "path": d + "recovery.img"},
+                               # {"partition_name": "recovery_b", "path": d + "recovery.img"},
+                               {"partition_name": "init_boot_a", "path": d + "init_boot.img"},
+                               {"partition_name": "init_boot_b", "path": d + "init_boot.img"},
                                {"partition_name": "efisp_a", "path": "abl.pe"},
                                {"partition_name": "efisp", "path": "abl.pe"},
                                ]
         if fix == defines.FIX_SAMSUNG:
-            self.partition_list.append({"partition_name": "param", "path": "param-samsung.img"})
-            self.partition_list.append({"partition_name": "debug", "path": "debug-samsung.img"})
+            self.partition_list.append({"partition_name": "param", "path": d + "param.img"})
+            self.partition_list.append({"partition_name": "debug", "path": d + "debug.img"})
+            self.partition_list.append({"partition_name": "optics_a", "path": d + "optics.img"})
+            self.partition_list.append({"partition_name": "optics_b", "path": d + "optics.img"})
+            self.partition_list.append({"partition_name": "prism_a", "path": d + "prism.img"})
+            self.partition_list.append({"partition_name": "prism_b", "path": d + "prism.img"})
+            self.partition_list.append({"partition_name": "btd", "path": d + "btd.img"})
 
         current_lba = 0
         for partition in self.partition_list:
-            try:
-                partition["size"] = os.path.getsize(partition["path"])
-            except FileNotFoundError:
-                partition["size"] = 0x10000 * defines.BLOCK_SIZE
+            #try:
+            partition["size"] = os.path.getsize(partition["path"])
+            #except FileNotFoundError:
+                
+                #partition["size"] = 0x10000 * defines.BLOCK_SIZE
             partition["starting_lba"] = current_lba
             partition["ending_lba"] = current_lba + partition["size"] // defines.BLOCK_SIZE - 1
             current_lba += partition["size"] // defines.BLOCK_SIZE

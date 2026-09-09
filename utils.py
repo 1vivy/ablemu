@@ -63,6 +63,17 @@ def read_string(mu: Uc, addr: int) -> str:
         addr += 1
     return data.decode("utf-8", errors="ignore")
 
+def read_string16(mu: Uc, addr: int) -> str:
+    """Read a null-terminated UTF-16LE string from emulated memory."""
+    data = bytearray()
+    while True:
+        b = mu.mem_read(addr, 2)
+        if b[0] == 0 and b[1] == 0:
+            break
+        data.extend(b)
+        addr += 2
+    return data.decode("utf-16le", errors="ignore")
+
 def hexdump(data: bytes):
     for i in range(0, len(data), 16):
         ascii_str = [chr(b) if 32 <= b <= 126 else '.' for b in data[i:i+16]]

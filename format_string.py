@@ -29,6 +29,7 @@ def process_format_string(mu: Uc, fmt: str, args: list) -> str:
                         if val & 0x8000000000000000:
                             val = -(0x10000000000000000 - val)
                     else:
+                        val &= (1 << 32) - 1
                         if val & 0x80000000:
                             val = -(0x100000000 - val)
                     result += str(val)

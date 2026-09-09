@@ -39,9 +39,11 @@ from protocols import (BlockIoProtocol,
   PlatformInfoProtocol,
   ResetReasonProtocol,
   SamsungFuelGaugeProtocol,
+  SimpleTextInputExProtocol,
+  EfiPilProtocol,
   feed_fastboot_cmd,
-  set_reset_reason, set_video_output_dir)
-from utils import align_up, allocate_mock, map_mock_base, ensure_mapped, call_dynamic_hook, guid_to_str, set_simple_hook
+  set_reset_reason, set_video_output_dir, set_args)
+from utils import align_up, allocate_mock, map_mock_base, ensure_mapped, call_dynamic_hook, guid_to_str, read_string, set_simple_hook
 from format_string import process_format_string
 from partitions import PartitionList
 import defines
@@ -69,6 +71,8 @@ chip_info_protocol = ChipInfoProtocol()
 platform_info_protocol = PlatformInfoProtocol()
 reset_reason_protocol = ResetReasonProtocol()
 samsung_fuel_gauge_protocol = SamsungFuelGaugeProtocol()
+simple_text_input_ex_protocol = SimpleTextInputExProtocol()
+efi_pil_protocol = EfiPilProtocol()
 
 # Registry for protocol lookups
 PROTOCOL_REGISTRY = {
@@ -92,6 +96,8 @@ PROTOCOL_REGISTRY = {
     defines.EFI_PLATFORMINFO_PROTOCOL_GUID: platform_info_protocol,
     defines.EFI_RESETREASON_PROTOCOL_GUID: reset_reason_protocol,
     defines.SAMSUNG_FUEL_GAUGE_PROTOCOL_GUID: samsung_fuel_gauge_protocol,
+    defines.EFI_SIMPLE_TEXT_INPUT_EX_PROTOCOL_GUID: simple_text_input_ex_protocol,
+    defines.EFI_PIL_PROTOCOL_GUID: efi_pil_protocol,
 }
 
 def make_heap_alloc(mu):
@@ -128,6 +134,8 @@ _malloc_map = {}  # Track allocated blocks for FreePool
 breakpoints = set()  # Set of breakpoint addresses
 step_mode = False  # Single-step execution flag
 emulation_paused = False  # Flag to pause emulation at breakpoint
+
+guid_name_map = {}
 
 # ---------------------------------------------------------------------------
 # PE Loader
@@ -339,6 +347,21 @@ def setup_uefi_tables(mu: Uc, chip_id: int, chip_version: int):
     platform_info_protocol.setup(mu)
     reset_reason_protocol.setup(mu)
     samsung_fuel_gauge_protocol.setup(mu)
+    simple_text_input_ex_protocol.setup(mu)
+    efi_pil_protocol.setup(mu)
+
+def parse_guid_csv(csv_path):
+    if csv_path == None:
+        return
+    import csv
+    
+    for line in csv.reader(open(csv_path)):
+        guid_name_map[line[0].upper()] = line[1]
+
+def known_guid(guid_str):
+    if guid_str in guid_name_map:
+        return f"{guid_str} ({guid_name_map[guid_str]})"
+    return f"{guid_str} (Unknown)"
 
 # Area for BootServices / RuntimeServices function names
 EFI_BOOT_SERVICES_NAMES = {
@@ -917,30 +940,29 @@ def hook_intr(mu: Uc, intno: int, user_data):
                 try:
                     guid_bytes = bytes(mu.mem_read(guid_ptr, 16))
                     guid_str = guid_to_str(guid_bytes)
+                    guid_name = known_guid(guid_str)
+                    proto = PROTOCOL_REGISTRY.get(guid_str.upper())
                     #print(f"       -> Protocol GUID: {guid_str} (Requested) (From 0x{lr:016X})")
                     
                     if table_off == 0x140: # LocateProtocol
-                        proto = PROTOCOL_REGISTRY.get(guid_str.upper())
                         if proto:
                             ret_status = proto.handle_locate_protocol(mu, x2)
                         else:
-                            print(f"       -> Protocol {guid_str} not in registry, returning generic mock interface.")
+                            print(f"       -> Protocol {guid_name} not in registry, returning generic mock interface.")
                             mu.mem_write(x2, struct.pack("<Q", MOCK_REGION))
                     
                     elif table_off == 0x138: # LocateHandleBuffer
-                        proto = PROTOCOL_REGISTRY.get(guid_str.upper())
                         if proto:
                             ret_status = proto.handle_locate_handle_buffer(mu, x4, x3, allocator=make_heap_alloc(mu))
                         else:
-                            print(f"       -> [LocateHandleBuffer] Protocol {guid_str} not in registry, returning EFI_NOT_FOUND.")
+                            print(f"       -> [LocateHandleBuffer] Protocol {guid_name} not in registry, returning EFI_NOT_FOUND.")
                             ret_status = 0x800000000000000E # EFI_NOT_FOUND
                             
                     elif table_off in (0x98, 0x118): # HandleProtocol or OpenProtocol
-                        proto = PROTOCOL_REGISTRY.get(guid_str.upper())
                         if proto:
                             ret_status = proto.handle_open_protocol(mu, x0, x2)
                         else:
-                            print(f"       -> [OpenProtocol] Protocol {guid_str} not in registry, providing generic mocked protocol fallback.")
+                            print(f"       -> [OpenProtocol] Protocol {guid_name} not in registry, providing generic mocked protocol fallback.")
                             mu.mem_write(x2, struct.pack("<Q", MOCK_REGION))
                             ret_status = 0
 
@@ -987,9 +1009,11 @@ def hook_intr(mu: Uc, intno: int, user_data):
         elif insn == 0xD4200080: # BRK #4 (VerifiedBoot Protocol Mock)
             verified_boot_protocol.handle_call(mu, pc)
             mu.reg_write(UC_ARM64_REG_PC, pc + 4)
-        elif insn == 0xD42000A0: # BRK #5 (BlockIo.ReadBlocks Mock)
-            blockio_protocol.handle_read_blocks(mu)
-            mu.reg_write(UC_ARM64_REG_PC, pc + 4)
+
+        # Migrated to dynamic hook
+        # elif insn == 0xD42000A0: # BRK #5 (BlockIo.ReadBlocks Mock)
+        #     blockio_protocol.handle_read_blocks(mu)
+        #     mu.reg_write(UC_ARM64_REG_PC, pc + 4)
         elif insn == 0xD42000C0: # BRK #6 (MemCardInfo Protocol)
             mem_card_info_protocol.handle_call(mu, pc)
             mu.reg_write(UC_ARM64_REG_PC, pc + 4)
@@ -1173,6 +1197,8 @@ def main():
     parser.add_argument("--fix", type=int, default=0x0, help="Fix for specific device or version. 0: No, 1: Samsung")
     parser.add_argument("--video-out-dir", type=str, default=None, help="Output directory of video output")
     parser.add_argument("--qfprom", type=str, default=None, help="qfprom image file.")
+    parser.add_argument("--devinfo-path", type=str, default=None, help="Path to devinfo.img.")
+    parser.add_argument("--guid-csv", type=str, default=None, help="Path to guid.csv.")
     args = parser.parse_args()
 
     if args.feed_cmd:
@@ -1180,10 +1206,13 @@ def main():
             feed_fastboot_cmd(cmd)
 
     set_video_output_dir(args.video_out_dir)
+    set_args(args)
 
     pe_data = extract_pe(args.pe)
     print(f"[*] Trace mode: {'ON' if _trace_enabled else 'OFF'}  "
           f"(set EMU_TRACE=1 to enable)")
+
+    parse_guid_csv(args.guid_csv)
 
     # -----------------------------------------------------------------------
     # 1. Create Unicorn instance (AArch64)
@@ -1336,6 +1365,7 @@ def main():
             if len(qfprom_img) != QFPROM_LEN:
                 print(f"WARNING: QFPROM Size is not valid.")
             mu.mem_write(QFPROM_ADDR, qfprom_img)
+        mu.mem_protect(QFPROM_ADDR, QFPROM_LEN, UC_PROT_READ)
 
         def qfprom_hook(uc, access, address, size, value, user_data):
             read_value = mu.mem_read(address, size)
@@ -1345,7 +1375,10 @@ def main():
         # 0x00000000221C397C is also qfprom?
         QFPROM2_ADDR = 0x221c3000
         QFPROM2_LEN = 0x1000
-        mu.mem_map(QFPROM2_ADDR, QFPROM2_LEN, UC_PROT_ALL)
+        mu.mem_map(QFPROM2_ADDR, QFPROM2_LEN, UC_PROT_READ)
+        # Knox guard fuse?
+        mu.mem_write(0x00000000221C397C, struct.pack("<I", 0))
+        mu.hook_add(UC_HOOK_MEM_READ, qfprom_hook, begin=QFPROM2_ADDR, end=QFPROM2_ADDR + QFPROM2_LEN)
 
         def hook_zero_mem(mu: Uc, address: int, size: int, user_data):
             x0 = mu.reg_read(UC_ARM64_REG_X0)
@@ -1357,14 +1390,18 @@ def main():
 
         mu.hook_add(UC_HOOK_CODE, hook_zero_mem, begin=0x6e6c, end=0x6e6c)
 
-        traces = [0x11644, 0x3fd4, 0x76000]
+        traces = [0x11644, 0x3fd4, 0x76000, 0x0008db10]
         for trace in traces:
             def samsung_test_hook1(mu: Uc, address: int, size: int, user_data):
                 x0 = mu.reg_read(UC_ARM64_REG_X0)
                 x1 = mu.reg_read(UC_ARM64_REG_X1)
-                x2 = mu.reg_read(UC_ARM64_REG_X1)
+                x2 = mu.reg_read(UC_ARM64_REG_X2)
+                x3 = mu.reg_read(UC_ARM64_REG_X3)
                 lr = mu.reg_read(UC_ARM64_REG_LR)
-                print(f"Samsung test hook {address:X}: Called from {lr:X} x0: {x0:X} x1: {x1:X} x2: {x2:X}")
+                if address == 0x0008db10:
+                    print(f"Samsung 0008db10: Called from {lr:X} x0: {read_string(mu, x0)} x1: {x1} x2: {x2} x3: {x3:X}")
+                else:
+                    print(f"Samsung test hook {address:X}: Called from {lr:X} x0: {x0:X} x1: {x1:X} x2: {x2:X}")
 
             mu.hook_add(UC_HOOK_CODE, samsung_test_hook1, begin=trace, end=trace)
 
@@ -1422,7 +1459,9 @@ def main():
                 if root_dev_type != 0:
                     try:
                         guid_bytes = bytes(mu.mem_read(root_dev_type, 16))
-                        print(f"           RootDeviceType GUID: {guid_to_str(guid_bytes)}")
+                        guid_str = guid_to_str(guid_bytes)
+                        guid_name = known_guid(guid_str)
+                        print(f"           RootDeviceType GUID: {guid_name}")
                     except UcError:
                         print(f"           RootDeviceType GUID: <unreadable at 0x{root_dev_type:016X}>")
                 
@@ -1430,7 +1469,9 @@ def main():
                 if partition_type != 0:
                     try:
                         guid_bytes = bytes(mu.mem_read(partition_type, 16))
-                        print(f"           PartitionType GUID: {guid_to_str(guid_bytes)}")
+                        guid_str = guid_to_str(guid_bytes)
+                        guid_name = known_guid(guid_str)
+                        print(f"           PartitionType GUID: {guid_name}")
                     except UcError:
                         print(f"           PartitionType GUID: <unreadable at 0x{partition_type:016X}>")
                 
