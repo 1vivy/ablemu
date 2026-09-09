@@ -3,6 +3,7 @@ from unicorn import UC_PROT_ALL, Uc, UC_HOOK_CODE
 import defines
 
 DYNAMIC_HOOKS = {}
+guid_name_map = {}
 
 def align_up(value: int, alignment: int) -> int:
     return (value + alignment - 1) & ~(alignment - 1)
@@ -79,9 +80,23 @@ def hexdump(data: bytes):
         ascii_str = [chr(b) if 32 <= b <= 126 else '.' for b in data[i:i+16]]
         print(f"{i:04X}: {data[i:i+16].hex()} | {''.join(ascii_str)}")
 
-def guid_to_str(guid: bytes) -> str:
+def guid_to_str(guid: bytes | bytearray) -> str:
     # little endian
     return f"{guid[0:4][::-1].hex().upper()}-{guid[4:6][::-1].hex().upper()}-{guid[6:8][::-1].hex().upper()}-{guid[8:10].hex().upper()}-{guid[10:16].hex().upper()}"
+
+def parse_guid_csv(csv_path):
+    if csv_path == None:
+        return
+    import csv
+    
+    for line in csv.reader(open(csv_path)):
+        guid_name_map[line[0].upper()] = line[1]
+
+def known_guid(guid_str):
+    if guid_str in guid_name_map:
+        return f"{guid_str} ({guid_name_map[guid_str]})"
+    return f"{guid_str} (Unknown)"
+
 
 def set_simple_hook(mu: Uc, addr: int, hook: callable):
     mu.hook_add(UC_HOOK_CODE, hook, begin=addr, end=addr)

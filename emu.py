@@ -43,7 +43,7 @@ from protocols import (BlockIoProtocol,
   EfiPilProtocol,
   feed_fastboot_cmd,
   set_reset_reason, set_video_output_dir, set_args)
-from utils import align_up, allocate_mock, map_mock_base, ensure_mapped, call_dynamic_hook, guid_to_str, read_string, set_simple_hook
+from utils import align_up, allocate_mock, map_mock_base, ensure_mapped, call_dynamic_hook, guid_to_str, read_string, set_simple_hook, parse_guid_csv, known_guid
 from format_string import process_format_string
 from partitions import PartitionList
 import defines
@@ -134,8 +134,6 @@ _malloc_map = {}  # Track allocated blocks for FreePool
 breakpoints = set()  # Set of breakpoint addresses
 step_mode = False  # Single-step execution flag
 emulation_paused = False  # Flag to pause emulation at breakpoint
-
-guid_name_map = {}
 
 # ---------------------------------------------------------------------------
 # PE Loader
@@ -349,19 +347,6 @@ def setup_uefi_tables(mu: Uc, chip_id: int, chip_version: int):
     samsung_fuel_gauge_protocol.setup(mu)
     simple_text_input_ex_protocol.setup(mu)
     efi_pil_protocol.setup(mu)
-
-def parse_guid_csv(csv_path):
-    if csv_path == None:
-        return
-    import csv
-    
-    for line in csv.reader(open(csv_path)):
-        guid_name_map[line[0].upper()] = line[1]
-
-def known_guid(guid_str):
-    if guid_str in guid_name_map:
-        return f"{guid_str} ({guid_name_map[guid_str]})"
-    return f"{guid_str} (Unknown)"
 
 # Area for BootServices / RuntimeServices function names
 EFI_BOOT_SERVICES_NAMES = {
@@ -1405,15 +1390,19 @@ def main():
 
             mu.hook_add(UC_HOOK_CODE, samsung_test_hook1, begin=trace, end=trace)
 
-        mem_addr = 0x17b990
-        def samsung_mem_hook(uc, access, address, size, value, user_data):
-            if address == mem_addr:
-                print(f"Mem hook:")
-                print(f"    addr : 0x{address:X}")
-                print(f"    size: {size} B")
-                print(f"    value: 0x{value:X}")
+        mem_hook_addrs = [0x17b990, 0x0000000000132A58]
+        def samsung_mem_hook(mu: Uc, access, address, size, value, user_data):
+            pc = mu.reg_read(UC_ARM64_REG_PC)
 
-        mu.hook_add(UC_HOOK_MEM_WRITE, samsung_mem_hook, begin=mem_addr)
+            print(f"Mem hook:")
+            print(f"    access : {access}")
+            print(f"    addr : 0x{address:X}")
+            print(f"    size: {size} B")
+            print(f"    value: 0x{value:X}")
+            print(f"    pc   : 0x{pc:X}")
+
+        for addr in mem_hook_addrs:
+            mu.hook_add(UC_HOOK_MEM_WRITE, samsung_mem_hook, begin=addr, end=addr)
 
     def hook_getblkiohandles(mu: Uc, address: int, size: int, user_data):
         x0 = mu.reg_read(UC_ARM64_REG_X0)  # SelectionAttrib

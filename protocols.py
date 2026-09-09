@@ -1,9 +1,9 @@
 import struct
 import os
 from unicorn.arm64_const import *
-from unicorn import UcError
+from unicorn import UcError, Uc
 from utils import (align_up, allocate_mock, allocate_mock_bytes,
-ensure_mapped, read_string16, register_dynamic_hook, read_string, hexdump, guid_to_str)
+ensure_mapped, read_string16, register_dynamic_hook, read_string, hexdump, guid_to_str, known_guid)
 from format_string import process_format_string
 import defines
 import queue
@@ -1530,7 +1530,7 @@ class Hash2Protocol(Protocol):
         mu.mem_write(interface_ptr_ptr_addr, struct.pack("<Q", self.addr))
         return 0
 
-    def handle_call(self, mu, func_name):
+    def handle_call(self, mu: Uc, func_name):
         func_idx = mu.reg_read(UC_ARM64_REG_X16)
         func_name = self.funcs[func_idx] if func_idx < len(self.funcs) else f"Unknown_Hash_Func_{func_idx}"
         
@@ -1541,11 +1541,42 @@ class Hash2Protocol(Protocol):
             mu.mem_write(hash_size_ptr, struct.pack("<Q", 0x20))
             mu.reg_write(UC_ARM64_REG_X0, 0)
         elif func_name == "Hash":
-            print(f"       -> [Hash2] Hash called")
+            hash_algo_guid_ptr = mu.reg_read(UC_ARM64_REG_X1)
+            message = mu.reg_read(UC_ARM64_REG_X2)
+            message_size = mu.reg_read(UC_ARM64_REG_X3)
+            hash_buf = mu.reg_read(UC_ARM64_REG_X4)
+            guid = guid_to_str(mu.mem_read(hash_algo_guid_ptr, 16))
+            print(f"       -> [Hash2] Hash called: {known_guid(guid)}")
+            if guid == defines.EfiHashAlgorithmSha256:
+                hash_instance = hashlib.sha256()
+            elif guid == defines.EfiHashAlgorithmSha512:
+                hash_instance = hashlib.sha512()
+            else:
+                print(f"Warning: Unsupported hash algorithm")
+                mu.reg_write(UC_ARM64_REG_X0, -1)
+                return
+            message_buf = mu.mem_read(message, message_size)
+            hash_instance.update(message_buf)
+            digest = hash_instance.digest()
+            mu.mem_write(hash_buf, digest)
+            print(f"         -> [Hash2] Message: {message_buf[0:16].hex()}")
+            print(f"         -> [Hash2] MessageSize: {message_size}")
+            print(f"         -> [Hash2] Digest: {digest.hex()}")
+
             mu.reg_write(UC_ARM64_REG_X0, 0)
         elif func_name == "HashInit":
-            print(f"       -> [Hash2] HashInit called")
-            self.hash_instance = hashlib.sha256()
+            hash_algo_guid_ptr = mu.reg_read(UC_ARM64_REG_X1)
+            guid = guid_to_str(mu.mem_read(hash_algo_guid_ptr, 16))
+            print(f"       -> [Hash2] HashInit called: {known_guid(guid)}")
+            if guid == defines.EfiHashAlgorithmSha256:
+                self.hash_instance = hashlib.sha256()
+            elif guid == defines.EfiHashAlgorithmSha512:
+                self.hash_instance = hashlib.sha512()
+            else:
+                print(f"Warning: Unsupported hash algorithm")
+                mu.reg_write(UC_ARM64_REG_X0, -1)
+                return
+
             self.hashed_size = 0
             mu.reg_write(UC_ARM64_REG_X0, 0)
         elif func_name == "HashUpdate":
@@ -1570,6 +1601,7 @@ class QSEEComProtocol(Protocol):
         self.funcs_offset = 8
         self.funcs = ["QseecomStartApp", "QseecomShutdownApp", "QseecomSendCmd", "QseecomStartAppByGuid"]
 
+    KEYMASTER_APP_ID = 1
     KEYMASTER_UTILS_CMD_ID = 0x200
     KEYMASTER_GET_VERSION = KEYMASTER_UTILS_CMD_ID + 0
     KEYMASTER_SET_ROT = KEYMASTER_UTILS_CMD_ID + 1
@@ -1584,6 +1616,9 @@ class QSEEComProtocol(Protocol):
     KEYMASTER_SET_VBH = KEYMASTER_UTILS_CMD_ID + 17
     KEYMASTER_GET_DATE_SUPPORT = KEYMASTER_UTILS_CMD_ID + 21
     KEYMASTER_FBE_SET_SEED = KEYMASTER_UTILS_CMD_ID + 24
+
+    BK_SEC_APP_APP_ID = 2
+    BK_SEC_APP_GET_KDF = 50
 
     
     def setup(self, mu):
@@ -1622,8 +1657,10 @@ class QSEEComProtocol(Protocol):
             app_name = read_string(mu, mu.reg_read(UC_ARM64_REG_X1))
             app_id_ptr = mu.reg_read(UC_ARM64_REG_X2)
             app_id = 0
-            if app_name == "bksecapp_a":
-                app_id = 1
+            if app_name == "keymaster":
+                app_id = self.KEYMASTER_APP_ID
+            elif app_name == "bksecapp_a":
+                app_id = self.BK_SEC_APP_APP_ID
             mu.mem_write(app_id_ptr, struct.pack("<I", app_id))
 
             print(f"       -> [QSEECom] QseecomStartApp called: {app_name} app_id: {app_id}")
@@ -1632,36 +1669,44 @@ class QSEEComProtocol(Protocol):
             print(f"       -> [QSEECom] QseecomShutdownApp called")
             mu.reg_write(UC_ARM64_REG_X0, 0)
         elif func_name == "QseecomSendCmd":
+            app_id = mu.reg_read(UC_ARM64_REG_X1)
             req_ptr = mu.reg_read(UC_ARM64_REG_X2)
             req_len = mu.reg_read(UC_ARM64_REG_X3)
             res_ptr = mu.reg_read(UC_ARM64_REG_X4)
             res_len = mu.reg_read(UC_ARM64_REG_X5)
             req_data = mu.mem_read(req_ptr, req_len)
             cmd_id = struct.unpack("<I", req_data[:4])[0]
-            print(f"       -> [QSEECom] QseecomSendCmd called, cmd_id: {cmd_id}")
-            if cmd_id == self.KEYMASTER_GET_VERSION:
-                if res_len >= 20:
-                    mu.mem_write(res_ptr, struct.pack("<IIIII", 0, 2, 0, 0, 0))
-            elif cmd_id == self.KEYMASTER_SET_ROT:
-                RotOffset, RotSize = struct.unpack("<II", req_data[4:12])
-                RotDigest = req_data[12:12+32]
-                print(f"       -> [QSEECom] SetRot: Offset: {RotOffset}, Size: {RotSize}, Digest: {RotDigest.hex()}")
+            print(f"       -> [QSEECom] QseecomSendCmd called, app_id: {app_id} cmd_id: {cmd_id}")
+            if app_id == self.KEYMASTER_APP_ID:
+                if cmd_id == self.KEYMASTER_GET_VERSION:
+                    if res_len >= 20:
+                        mu.mem_write(res_ptr, struct.pack("<IIIII", 0, 2, 0, 0, 0))
+                elif cmd_id == self.KEYMASTER_SET_ROT:
+                    RotOffset, RotSize = struct.unpack("<II", req_data[4:12])
+                    RotDigest = req_data[12:12+32]
+                    print(f"       -> [QSEECom] SetRot: Offset: {RotOffset}, Size: {RotSize}, Digest: {RotDigest.hex()}")
 
-                mu.reg_write(UC_ARM64_REG_X0, 0)
-            elif cmd_id == self.KEYMASTER_SET_BOOT_STATE:
-                IsUnlocked = struct.unpack("<I", req_data[16:16+4])[0]
-                PublicKey = req_data[16+4:16+4+32]
-                Color, SystemVersion, SystemSecurityLevel = struct.unpack("<III", req_data[16+4+32:16+4+32+12])
-                print(f"       -> [QSEECom] SetBootState called. IsUnlocked: {IsUnlocked}, PublicKey: {PublicKey.hex()}, Color: {Color}, SystemVersion: {SystemVersion}, SystemSecurityLevel: {SystemSecurityLevel}")
+                    mu.reg_write(UC_ARM64_REG_X0, 0)
+                elif cmd_id == self.KEYMASTER_SET_BOOT_STATE:
+                    IsUnlocked = struct.unpack("<I", req_data[16:16+4])[0]
+                    PublicKey = req_data[16+4:16+4+32]
+                    Color, SystemVersion, SystemSecurityLevel = struct.unpack("<III", req_data[16+4+32:16+4+32+12])
+                    print(f"       -> [QSEECom] SetBootState called. IsUnlocked: {IsUnlocked}, PublicKey: {PublicKey.hex()}, Color: {Color}, SystemVersion: {SystemVersion}, SystemSecurityLevel: {SystemSecurityLevel}")
 
-                mu.reg_write(UC_ARM64_REG_X0, 0)
-            elif cmd_id == self.KEYMASTER_SET_VBH:
-                VBHash = req_data[4:4+32]
-                print(f"       -> [QSEECom] SetVBH called. VBHash: {VBHash.hex()}")
+                    mu.reg_write(UC_ARM64_REG_X0, 0)
+                elif cmd_id == self.KEYMASTER_SET_VBH:
+                    VBHash = req_data[4:4+32]
+                    print(f"       -> [QSEECom] SetVBH called. VBHash: {VBHash.hex()}")
 
-                mu.reg_write(UC_ARM64_REG_X0, 0)
-            else:
-                print(f"       -> [QSEECom] Unknown command: {cmd_id}")
+                    mu.reg_write(UC_ARM64_REG_X0, 0)
+                else:
+                    print(f"       -> [QSEECom] Unknown command: {cmd_id}")
+            elif app_id == self.BK_SEC_APP_APP_ID:
+                if cmd_id == self.BK_SEC_APP_GET_KDF:
+                    if res_len >= 4 + 4 + 16:
+                        key = bytes([i for i in range(16)])
+                        mu.mem_write(res_ptr, struct.pack("<II", 0, 16) + key)
+
 
             mu.reg_write(UC_ARM64_REG_X0, 0)
         elif func_name == "QseecomStartAppByGuid":
