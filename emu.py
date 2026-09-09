@@ -189,7 +189,7 @@ def load_pe(mu: Uc, data: bytes) -> tuple[int, int]:
 # UEFI stub helpers
 # ---------------------------------------------------------------------------
 
-def setup_uefi_tables(mu: Uc, chip_id: int, chip_version: int):
+def setup_uefi_tables(mu: Uc, chip_id: int, chip_version: int, foundry_id: int, platform_id: int, ram_mb: int):
     """Create minimal EFI_SYSTEM_TABLE / EFI_BOOT_SERVICES stubs.
 
     The actual function pointers inside the table point to the RETURN_ADDR
@@ -335,14 +335,14 @@ def setup_uefi_tables(mu: Uc, chip_id: int, chip_version: int):
     
     kernel_interface_protocol.setup(mu, MOCK_FUNC_ADDR)
     mem_card_info_protocol.setup(mu)
-    ram_partition_protocol.setup(mu)
+    ram_partition_protocol.setup(mu, ram_mb)
     usb_device_protocol.setup(mu)
     partition_entry_protocol.setup(mu)
     hash2_protocol.setup(mu)
     qsee_com_protocol.setup(mu)
     qcom_scm_protocol.setup(mu)
-    chip_info_protocol.setup(mu, chip_id, chip_version)
-    platform_info_protocol.setup(mu)
+    chip_info_protocol.setup(mu, chip_id, chip_version, foundry_id)
+    platform_info_protocol.setup(mu, platform_id)
     reset_reason_protocol.setup(mu)
     samsung_fuel_gauge_protocol.setup(mu)
     simple_text_input_ex_protocol.setup(mu)
@@ -1035,8 +1035,10 @@ def hook_intr(mu: Uc, intno: int, user_data):
                 pass
             mu.emu_stop()
     elif intno == 13:
-        print(f"int 13: {insn:08X}")
-        mu.reg_write(UC_ARM64_REG_PC, pc + 4)
+        lr = mu.reg_read(UC_ARM64_REG_LR)
+        print(f"int 13: addr=0x{pc:X} lr=0x{lr:X} insn={insn:08X}")
+        # No need to pc = pc + 4 manually. Unicorn automatically skip this insn
+        #mu.reg_write(UC_ARM64_REG_PC, pc + 4)
         mu.reg_write(UC_ARM64_REG_X0, -1)
         if insn == 0xd4000003:
             print(f"SMC called: {mu.reg_read(UC_ARM64_REG_X0):X}")
@@ -1060,8 +1062,8 @@ def hook_mem_unmapped(mu: Uc, access, address: int, size: int,
     }.get(access, "UNKNOWN")
 
     pc = mu.reg_read(UC_ARM64_REG_PC)
-    print(f"[MEM]  Unmapped {access_str} at 0x{address:016X} "
-          f"(size={size}, value=0x{value:X}) PC=0x{pc:016X}")
+    print(f"[MEM]  Unmapped {access_str} at 0x{address:X} "
+          f"(size={size}, value=0x{value:X}) PC=0x{pc:X}")
 
     if access == UC_MEM_FETCH_UNMAPPED and address == RETURN_ADDR:
         # The emulated code tried to branch to our return catcher.
@@ -1073,10 +1075,10 @@ def hook_mem_unmapped(mu: Uc, access, address: int, size: int,
     page = address & ~(PAGE_SIZE - 1)
     try:
         mu.mem_map(page, PAGE_SIZE, UC_PROT_ALL)
-        print(f"       -> Mapped page 0x{page:016X}")
+        print(f"       -> Mapped page 0x{page:X}")
         return True
     except UcError:
-        print(f"       -> FAILED to map page 0x{page:016X}")
+        print(f"       -> FAILED to map page 0x{page:X}")
         return False
 
 
@@ -1176,8 +1178,11 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("pe", help="Path to PE file", default="abl.pe", nargs="?")
     parser.add_argument("--feed-cmd", action="append", help="Feed fastboot command")
-    parser.add_argument("--chip-id", type=int, default=0x26a, help="Chip ID")
-    parser.add_argument("--chip-version", type=int, default=0x10000, help="Chip version")
+    parser.add_argument("--chip-id", type=str, default="0x26a", help="Chip ID")
+    parser.add_argument("--chip-version", type=str, default="0x10000", help="Chip version")
+    parser.add_argument("--foundry-id", type=int, default=1, help="Foundry id")
+    parser.add_argument("--platform-id", type=str, default="0xb", help="Platform id")
+    parser.add_argument("--ram-mb", type=int, default=4096, help="Ram size in MBytes")
     parser.add_argument("--reset-reason", type=int, default=0x0, help="Reset reason. 0: Normal, 1: Recovery, 2: Fastboot, ...")
     parser.add_argument("--fix", type=int, default=0x0, help="Fix for specific device or version. 0: No, 1: Samsung")
     parser.add_argument("--video-out-dir", type=str, default=None, help="Output directory of video output")
@@ -1224,7 +1229,7 @@ def main():
     # -----------------------------------------------------------------------
     # 5. Set up UEFI stubs
     # -----------------------------------------------------------------------
-    setup_uefi_tables(mu, args.chip_id, args.chip_version)
+    setup_uefi_tables(mu, int(args.chip_id, 16), int(args.chip_version, 16), args.foundry_id, int(args.platform_id, 16), args.ram_mb)
 
     set_reset_reason(args.reset_reason)
 
@@ -1354,7 +1359,8 @@ def main():
 
         def qfprom_hook(uc, access, address, size, value, user_data):
             read_value = mu.mem_read(address, size)
-            print(f"QFPROM Read: address={address:X} size={size} bytes value={binascii.hexlify(read_value)}")
+            pc = mu.reg_read(UC_ARM64_REG_PC)
+            print(f"QFPROM Read: address={address:X} size={size} bytes pc={pc:X} value={binascii.hexlify(read_value)}")
         mu.hook_add(UC_HOOK_MEM_READ, qfprom_hook, begin=QFPROM_ADDR, end=QFPROM_ADDR + QFPROM_LEN)
 
         # 0x00000000221C397C is also qfprom?
@@ -1364,6 +1370,12 @@ def main():
         # Knox guard fuse?
         mu.mem_write(0x00000000221C397C, struct.pack("<I", 0))
         mu.hook_add(UC_HOOK_MEM_READ, qfprom_hook, begin=QFPROM2_ADDR, end=QFPROM2_ADDR + QFPROM2_LEN)
+
+        # 0x00000000221C20D8 is also qfprom?
+        QFPROM3_ADDR = 0x221c2000
+        QFPROM3_LEN = 0x1000
+        mu.mem_map(QFPROM3_ADDR, QFPROM3_LEN, UC_PROT_READ)
+        mu.hook_add(UC_HOOK_MEM_READ, qfprom_hook, begin=QFPROM3_ADDR, end=QFPROM3_ADDR + QFPROM3_LEN)
 
         def hook_zero_mem(mu: Uc, address: int, size: int, user_data):
             x0 = mu.reg_read(UC_ARM64_REG_X0)
@@ -1385,6 +1397,9 @@ def main():
                 lr = mu.reg_read(UC_ARM64_REG_LR)
                 if address == 0x0008db10:
                     print(f"Samsung 0008db10: Called from {lr:X} x0: {read_string(mu, x0)} x1: {x1} x2: {x2} x3: {x3:X}")
+                elif address == 0x3fd4:
+                    print(f"Samsung log hook {address:X}: Called from {lr:X} x0: {x0:X} x1: {x1:X} x2: {x2:X} Fix log level")
+                    mu.reg_write(UC_ARM64_REG_X0, 0x80000042)
                 else:
                     print(f"Samsung test hook {address:X}: Called from {lr:X} x0: {x0:X} x1: {x1:X} x2: {x2:X}")
 

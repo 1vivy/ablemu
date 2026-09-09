@@ -27,6 +27,9 @@ class PartitionList:
                                # {"partition_name": "recovery_b", "path": d + "recovery.img"},
                                {"partition_name": "init_boot_a", "path": d + "init_boot.img"},
                                {"partition_name": "init_boot_b", "path": d + "init_boot.img"},
+                               {"partition_name": "xbl_a", "path": d + "xbl.img"},
+                               {"partition_name": "tz_a", "path": d + "tz.img"},
+                               {"partition_name": "hyp_a", "path": d + "hyp.img"},
                                {"partition_name": "efisp_a", "path": "abl.pe"},
                                {"partition_name": "efisp", "path": "abl.pe"},
                                ]

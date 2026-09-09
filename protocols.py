@@ -721,7 +721,8 @@ class RamPartitionProtocol(Protocol):
         self.addr = 0
         self.stubs_addr = 0
 
-    def setup(self, mu):
+    def setup(self, mu, ram_mb: int):
+        self.ram_mb = ram_mb
         self.addr = allocate_mock(0x200) # Includes stubs
         self.stubs_addr = self.addr + 0x100
         # struct _EFI_RAMPARTITION_PROTOCOL { UINT64 Revision; ... }
@@ -789,10 +790,10 @@ class RamPartitionProtocol(Protocol):
                     # Partition 2: Base=0x8200_0000, AvailableLength=0x400_0000 (64 MB)
                     mu.mem_write(x1 + 16, struct.pack("<QQ", 0x82000000, 0x4000000))
                     # Partition 3: Base=0x9400_0000, AvailableLength=0x1_0000_0000 (4 GB)
-                    mu.mem_write(x1 + 32, struct.pack("<QQ", 0x84000000, 0x8000000))
+                    mu.mem_write(x1 + 32, struct.pack("<QQ", 0x84000000, self.ram_mb * 1024 * 1024))
                     mu.mem_write(x2, struct.pack("<I", 3))
                     ret_status = 0
-                    print(f"       -> [GetRamPartitions] Second call: filled buffer at 0x{x1:X} with 2 partitions")
+                    print(f"       -> [GetRamPartitions] Second call: filled buffer at 0x{x1:X} with 3 partitions")
             except UcError:
                 ret_status = 0x800000000000000F
         elif func_name == "GetMinPasrSize":
@@ -1881,9 +1882,10 @@ class ChipInfoProtocol(Protocol):
         self.chip_id = 0
         self.chip_version = 0
 
-    def setup(self, mu, chip_id, chip_version):
+    def setup(self, mu, chip_id, chip_version, foundry_id):
         self.chip_id = chip_id
         self.chip_version = chip_version
+        self.foundry_id = foundry_id
         self.generate_hook_funcs(mu, struct.pack("<Q", 0x0000000000010000))
     
     def handle_hook(self, mu, func_idx):
@@ -1918,6 +1920,7 @@ class ChipInfoProtocol(Protocol):
             print(f"       -> [ChipInfo] GetSerialNumber called")
             mu.reg_write(UC_ARM64_REG_X0, 0)
         elif func_name == "GetFoundryId":
+            mu.mem_write(mu.reg_read(UC_ARM64_REG_X1), struct.pack("<Q", self.foundry_id))
             print(f"       -> [ChipInfo] GetFoundryId called")
             mu.reg_write(UC_ARM64_REG_X0, 0)
         elif func_name == "GetRawDeviceFamily":
@@ -1978,13 +1981,14 @@ class PlatformInfoProtocol(Protocol):
             "GetKeyValue",
         ]
 
-    def setup(self, mu):
+    def setup(self, mu, platform_id):
+        self.platform_id = platform_id
         self.generate_hook_funcs(mu, struct.pack("<Q", 0x0000000000030000))
 
     def handle_hook(self, mu, func_idx):
         func_name = self.funcs[func_idx]
         if func_name == "GetPlatformInfo":
-            data = struct.pack("<IIIBxxxI", 0xb, 0, 0, 0, 0)
+            data = struct.pack("<IIIBxxxI", self.platform_id, 0, 0, 0, 0)
             mu.mem_write(mu.reg_read(UC_ARM64_REG_X1), data)
             print(f"       -> [PlatformInfo] GetPlatformInfo called. {data.hex()}")
             mu.reg_write(UC_ARM64_REG_X0, 0)
