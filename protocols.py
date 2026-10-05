@@ -1,5 +1,6 @@
 import struct
 import os
+import binascii
 from unicorn.arm64_const import *
 from unicorn import UcError, Uc
 from utils import (align_up, allocate_mock, allocate_mock_bytes,
@@ -7,7 +8,7 @@ ensure_mapped, read_string16, register_dynamic_hook, read_string, hexdump, guid_
 from format_string import process_format_string
 import defines
 import queue
-from partitions import PartitionList
+from partitions import PartitionList, build_gpt
 import hashlib
 
 DISK_HANDLE = 0xDE000001
@@ -38,6 +39,11 @@ def set_args(args):
     global devinfo_path
     if args.devinfo_path != None:
         devinfo_path = args.devinfo_path
+
+
+def base_label(name: str) -> str:
+    """Strip the A/B slot suffix from a partition label."""
+    return name[:-2] if name[-2:] in ("_a", "_b") else name
 
 
 class Protocol():
@@ -91,6 +97,7 @@ class BlockIoProtocol(Protocol):
         self.protocols_addr = []
         self.read_stub_addr = 0
         self.partition_list = partition_list
+        self.disk_image = None
         self.funcs = ["Reset", "ReadBlocks", "WriteBlocks", "FlushBlocks"]
 
     def setup(self, mu, mock_func_addr):
@@ -220,7 +227,15 @@ struct _EFI_BLOCK_IO_PROTOCOL {
         print(f"         -> ReadBlocks | MediaId: {media_id}, LBA: 0x{lba:X}, Size: 0x{buf_size:X} into 0x{buf_ptr:X}")
         try:
             if media_id == MEDIA_DISK:
-                print("Warning: Disk whole partition read is not supported.")
+                # The ABL parses the GPT through the whole-disk handle before it
+                # can resolve a partition label to a partition handle.
+                if self.disk_image is None:
+                    self.disk_image = build_gpt(self.partition_list, defines.BLOCK_SIZE)
+                offset = lba * defines.BLOCK_SIZE
+                read_data = self.disk_image[offset : offset + buf_size]
+                read_data += b"\x00" * (buf_size - len(read_data))
+                ensure_mapped(mu, buf_ptr, len(read_data))
+                mu.mem_write(buf_ptr, read_data)
                 mu.reg_write(UC_ARM64_REG_X0, 0)
                 return
 
@@ -357,7 +372,7 @@ class PartitionEntryProtocol(Protocol):
 
     def create_partition_entry(self, partition_name_str: str, starting_lba: int, ending_lba: int) -> bytes:
         """Create a single EFI partition entry."""
-        guid_seed = hash(partition_name_str) & 0xFFFFFFFF
+        guid_seed = binascii.crc32(partition_name_str.encode()) & 0xFFFFFFFF
         partition_type_guid = struct.pack("<IHH8B", guid_seed, 0x0000, 0x0000, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00)
         
         # Generate unique GUID based on partition name
@@ -367,6 +382,11 @@ class PartitionEntryProtocol(Protocol):
         attributes = 0
         
         # PartitionName in UTF-16LE, padded to 72 bytes (36 CHAR16 entries)
+        # The QCOM ABL partition-entry interface reports the slot-less label:
+        # the ABL builds "boot_a"/"boot_b" itself from the base label and the
+        # selected slot, and compares that against this field. A slot-suffixed
+        # label here makes every partition lookup miss.
+        partition_name_str = base_label(partition_name_str)
         partition_name_utf16 = partition_name_str.encode('utf-16le')
         partition_name = partition_name_utf16 + b'\x00\x00' * (36 - len(partition_name_str))
         
@@ -410,12 +430,14 @@ class PartitionEntryProtocol(Protocol):
     def handle_open_protocol(self, mu, handle, interface_ptr_ptr_addr):
         if handle == DISK_HANDLE:
             partition_addr = self.disk_addr
-            #print(f"       -> [OpenProtocol] Returning partition array for disk 0x{handle:X} at 0x{partition_addr:X}.")
+            name = "Disk"
         else:
             partition_index = handle - HANDLE_INDEX_0
             partition_addr = self.partitions_addr[partition_index]
-            #print(f"       -> [OpenProtocol] Partition handle 0x{handle:X}, returning partition array at 0x{partition_addr:X}")
-        
+            name = self.partition_list[partition_index]["partition_name"]
+        if os.environ.get("EMU_PROTO_TRACE"):
+            print(f"       -> [PartitionEntry] handle 0x{handle:X} -> '{name}' @0x{partition_addr:X}")
+
         mu.mem_write(interface_ptr_ptr_addr, struct.pack("<Q", partition_addr))
         return 0
 

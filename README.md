@@ -86,11 +86,52 @@ $ python emu.py abl.elf --feed-cmd "getvar:all" --reset-reason 2 | grep -ai usb
 
 Tested on Y700 gen4 TB322FC (ZUXOS_1.5.10.063_260111_PRC). emu.py currently embeds some addresses for Y700 gen4 to log internal behaviors, but it is not neccessary for emulation.
 
+Also run against OnePlus 15 (infiniti, sm8850) `LinuxLoader.efi` with the device's
+own `boot_b`/`vendor_boot_b`/`init_boot_b`/`recovery_b` captures: the ABL resolves
+the partitions from the synthesized GPT, reads and hashes the AVB-signed images,
+and stops at its slot decision because the emulated platform reports no slot
+metadata (see `--dump-dir` for capturing the handoff once it does boot).
+
 ### Environment Variables
 
 - `EMU_TRACE=1`: Enable per-instruction tracing.
 - `EMU_DEBUG=1`: Start in interactive debug mode.
 - `EMU_LOG_OFF=1`: Disable verbose logging for certain UEFI services.
+- `EMU_PROTO_TRACE=1`: Log every BlockIo/DevicePath/PartitionEntry protocol request.
+
+### Running against real device captures
+
+The partition set is configurable, so a dump of a real device can be emulated
+directly. Each `--partition NAME=PATH` exposes `NAME` as a block device backed
+by `PATH`; the whole disk gets a synthesized GPT built from those names, sizes
+and LBAs, which is what the ABL parses to resolve a label to a handle.
+
+```bash
+python emu.py LinuxLoader.efi \
+    --partition boot_b=/captures/boot_b.img \
+    --partition vendor_boot_b=/captures/vendor_boot_b.img \
+    --partition init_boot_b=/captures/init_boot_b.img \
+    --reset-reason 1
+```
+
+`--partitions-json FILE` takes the same list as JSON. When no partition set is
+given the historical `samsung-imgs/` layout is used, and `--legacy-hooks`
+enables the device-specific code hooks that are only meaningful for the
+originally reverse-engineered targets.
+
+The QCOM ABL partition-entry interface reports the **slot-less** label (`boot`,
+not `boot_b`): the ABL appends `_a`/`_b` from the selected slot itself and
+compares against that field, so a suffixed label makes every lookup miss.
+
+### Dumping the kernel handoff
+
+`--dump-dir DIR` captures what the bootloader hands the kernel at the moment it
+branches to the kernel entry point: `kernel.bin` (located from the arm64 Image
+header), `ramdisk.bin` (the assembled initrd, taken from
+`/chosen/linux,initrd-start`/`-end`), `fdt.bin`, `cmdline.txt`, and
+`handoff.json` with the entry point, registers and addresses. Whether the kernel
+would *accept* that initrd is a separate host-side question; the module only
+records the bytes.
 
 ### Interactive Debugger Commands
 

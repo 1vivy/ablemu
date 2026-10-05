@@ -10,9 +10,11 @@ and begins emulation at the PE entry point.
 import struct
 import sys
 import os
+import json
 import lzma
 import argparse
 import binascii
+from pathlib import Path
 
 from unicorn import *
 from unicorn.arm64_const import *
@@ -47,6 +49,7 @@ from utils import align_up, allocate_mock, map_mock_base, ensure_mapped, call_dy
 from format_string import process_format_string
 from partitions import PartitionList
 import defines
+import handoff
 
 STRNCMP_ADDR = 0x1ddc
 
@@ -927,6 +930,8 @@ def hook_intr(mu: Uc, intno: int, user_data):
                     guid_str = guid_to_str(guid_bytes)
                     guid_name = known_guid(guid_str)
                     proto = PROTOCOL_REGISTRY.get(guid_str.upper())
+                    if os.environ.get("EMU_PROTO_TRACE"):
+                        print(f"       -> [PROTO] off=0x{table_off:X} {guid_name} from 0x{lr:X} handle=0x{x0:X} out=0x{x2:X}")
                     #print(f"       -> Protocol GUID: {guid_str} (Requested) (From 0x{lr:016X})")
                     
                     if table_off == 0x140: # LocateProtocol
@@ -1173,6 +1178,32 @@ def extract_pe(filename: str):
 # Main
 # ---------------------------------------------------------------------------
 
+def _configure_partitions(args):
+    """Turn --partitions-json / --partition flags into a PartitionList set."""
+    entries = []
+    if args.partitions_json:
+        with open(args.partitions_json, "r") as stream:
+            loaded = json.load(stream)
+        if isinstance(loaded, dict):
+            loaded = loaded.get("partitions", [])
+        for entry in loaded:
+            entries.append(
+                {"partition_name": entry["partition_name"], "path": entry["path"]}
+            )
+    if args.partition:
+        for spec in args.partition:
+            if "=" not in spec:
+                raise SystemExit(f"--partition expects NAME=PATH, got {spec!r}")
+            name, path = spec.split("=", 1)
+            entries = [e for e in entries if e["partition_name"] != name]
+            entries.append({"partition_name": name, "path": path})
+    if entries:
+        for entry in entries:
+            if not os.path.isfile(entry["path"]):
+                raise SystemExit(f"partition image not found: {entry['path']}")
+        partition_list.set_partitions(entries)
+
+
 def main():
     global args
     parser = argparse.ArgumentParser()
@@ -1189,7 +1220,18 @@ def main():
     parser.add_argument("--qfprom", type=str, default=None, help="qfprom image file.")
     parser.add_argument("--devinfo-path", type=str, default=None, help="Path to devinfo.img.")
     parser.add_argument("--guid-csv", type=str, default=None, help="Path to guid.csv.")
+    parser.add_argument("--partition", action="append", default=None, metavar="NAME=PATH",
+                        help="Expose NAME as a block device backed by PATH (repeatable). "
+                             "Replaces the built-in layout when given.")
+    parser.add_argument("--partitions-json", type=str, default=None,
+                        help="JSON file with a partition list (list of {partition_name, path}).")
+    parser.add_argument("--dump-dir", type=str, default=None,
+                        help="Directory to write the boot handoff artifacts into.")
+    parser.add_argument("--legacy-hooks", action="store_true",
+                        help="Enable the historical device-specific code hooks (Y700/Samsung).")
     args = parser.parse_args()
+
+    _configure_partitions(args)
 
     if args.feed_cmd:
         for cmd in args.feed_cmd:
@@ -1515,14 +1557,26 @@ def main():
             except UcError:
                 print(f"       FilterData: <unreadable>")
 
-    if args.fix == defines.FIX_SAMSUNG:
-        getblkiohandles_addr = image_base + 0x11a5c
-    else:
-        getblkiohandles_addr = image_base + 0xADB4
-    mu.hook_add(UC_HOOK_CODE, hook_getblkiohandles, begin=getblkiohandles_addr, end=getblkiohandles_addr)
-    #mu.hook_add(UC_HOOK_CODE, hook_getblkiohandles, begin=0x000149c0, end=0x000149c0)
+    if args.legacy_hooks:
+        getblkiohandles_addr = image_base + (0x11a5c if args.fix == defines.FIX_SAMSUNG else 0xADB4)
+        mu.hook_add(UC_HOOK_CODE, hook_getblkiohandles, begin=getblkiohandles_addr, end=getblkiohandles_addr)
+    #mu.hook_add(UC_HOOK_CODE, hook_log_15ec, begin=image_base + 0x15EC, end=image_base + 0x15EC)
 
     #mu.hook_add(UC_HOOK_CODE, hook_code, begin=STRNCMP_ADDR, end=STRNCMP_ADDR)
+
+    if args.dump_dir is not None:
+        dump_dir = Path(args.dump_dir)
+        captured = False
+
+        def hook_handoff(uc: Uc, address: int, size: int, user_data):
+            nonlocal captured
+            if captured:
+                return
+            captured = True
+            summary = handoff.capture(uc, address, dump_dir)
+            print(f"[HANDOFF] kernel entry reached; dumped to {dump_dir}: {json.dumps(summary, sort_keys=True)}")
+
+        mu.hook_add(UC_HOOK_CODE, hook_handoff, begin=defines.KERNEL_BASE, end=defines.KERNEL_BASE)
 
     mu.mem_map(defines.KERNEL_BASE, defines.KERNEL_SIZE)
     # We soon die after kernel is executed, but still some codes are emulated. This hook traces all kernel codes.
