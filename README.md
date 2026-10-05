@@ -89,8 +89,17 @@ Tested on Y700 gen4 TB322FC (ZUXOS_1.5.10.063_260111_PRC). emu.py currently embe
 Also run against OnePlus 15 (infiniti, sm8850) `LinuxLoader.efi` with the device's
 own `boot_b`/`vendor_boot_b`/`init_boot_b`/`recovery_b` captures: the ABL resolves
 the partitions from the synthesized GPT, reads and hashes the AVB-signed images,
-and stops at its slot decision because the emulated platform reports no slot
-metadata (see `--dump-dir` for capturing the handoff once it does boot).
+and then stops before the kernel branch because its slot decision needs platform
+state this emulator does not provide yet.
+
+That decision is LinuxLoader.efi's `0x1FC10` helper: it scans the ABL's in-RAM
+partition table (entry count at `0xB80A70`, 0x84-byte entries starting at
+`0x920B80`) for an entry whose name is the queried label followed by `_a` or
+`_b`, and the byte it returns becomes the multi-slot flag in the loader context
+(read at `0x23B44`). With the table empty the answer is "not multi-slot" and the
+ABL enters fastboot instead of branching to the kernel, so a capture run only
+reaches `--dump-dir` once that table is populated the way the platform firmware
+populates it.
 
 ### Environment Variables
 
