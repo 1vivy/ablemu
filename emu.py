@@ -203,7 +203,7 @@ def setup_uefi_tables(mu: Uc, chip_id: int, chip_version: int, foundry_id: int, 
     global MOCK_HANDLE_ARRAY_ADDR
     global args
 
-    partition_list.setup(args.fix)
+    partition_list.setup()
 
     # Map the entire MOCK region
     map_mock_base(mu)
@@ -964,15 +964,8 @@ def hook_intr(mu: Uc, intno: int, user_data):
                 src = x1
                 size = x2
                 print(f"       -> [CopyMem] Copying {size} bytes from 0x{src:X} to 0x{dest:X}")
-                skip = False
-                if args.fix == defines.FIX_SAMSUNG:
-                    if src == 0x888200000:
-                        skip = True
-                        print(f"       -> [CopyMem] Skip Samsung sec log buf")
-                
-                if not skip:
-                    print(f"       -> [CopyMem] Data: {mu.mem_read(src, size).hex()[0:100]}")
-                    mu.mem_write(dest, bytes(mu.mem_read(src, size)))
+                print(f"       -> [CopyMem] Data: {mu.mem_read(src, size).hex()[0:100]}")
+                mu.mem_write(dest, bytes(mu.mem_read(src, size)))
                 ret_status = x0
             elif svc_type == 0 and table_off == 0x158: # CalculateCrc32
                 data = mu.mem_read(x0, x1)
@@ -1215,9 +1208,7 @@ def main():
     parser.add_argument("--platform-id", type=str, default="0xb", help="Platform id")
     parser.add_argument("--ram-mb", type=int, default=4096, help="Ram size in MBytes")
     parser.add_argument("--reset-reason", type=int, default=0x0, help="Reset reason. 0: Normal, 1: Recovery, 2: Fastboot, ...")
-    parser.add_argument("--fix", type=int, default=0x0, help="Fix for specific device or version. 0: No, 1: Samsung")
     parser.add_argument("--video-out-dir", type=str, default=None, help="Output directory of video output")
-    parser.add_argument("--qfprom", type=str, default=None, help="qfprom image file.")
     parser.add_argument("--devinfo-path", type=str, default=None, help="Path to devinfo.img.")
     parser.add_argument("--guid-csv", type=str, default=None, help="Path to guid.csv.")
     parser.add_argument("--partition", action="append", default=None, metavar="NAME=PATH",
@@ -1227,8 +1218,6 @@ def main():
                         help="JSON file with a partition list (list of {partition_name, path}).")
     parser.add_argument("--dump-dir", type=str, default=None,
                         help="Directory to write the boot handoff artifacts into.")
-    parser.add_argument("--legacy-hooks", action="store_true",
-                        help="Enable the historical device-specific code hooks (Y700/Samsung).")
     args = parser.parse_args()
 
     _configure_partitions(args)
@@ -1384,186 +1373,6 @@ def main():
     hook_addr = image_base + 0x15EC
     #mu.hook_add(UC_HOOK_CODE, hook_log_15ec, begin=hook_addr, end=hook_addr)
 
-    if args.fix == defines.FIX_SAMSUNG:
-        # Workaround. Samsung Galaxy S26 ABL accesses 0xc221000 for some timer.
-        mu.mem_map(0xc221000, 0x1000, UC_PROT_ALL)
-
-        # Samsung access qfprom directly from LinuxLoader.
-        QFPROM_ADDR = 0x221c8000
-        QFPROM_LEN = 0x1000
-        mu.mem_map(QFPROM_ADDR, QFPROM_LEN, UC_PROT_ALL)
-        if args.qfprom != None:
-            qfprom_img = open(args.qfprom, "rb").read()
-            if len(qfprom_img) != QFPROM_LEN:
-                print(f"WARNING: QFPROM Size is not valid.")
-            mu.mem_write(QFPROM_ADDR, qfprom_img)
-        mu.mem_protect(QFPROM_ADDR, QFPROM_LEN, UC_PROT_READ)
-
-        def qfprom_hook(uc, access, address, size, value, user_data):
-            read_value = mu.mem_read(address, size)
-            pc = mu.reg_read(UC_ARM64_REG_PC)
-            print(f"QFPROM Read: address={address:X} size={size} bytes pc={pc:X} value={binascii.hexlify(read_value)}")
-        mu.hook_add(UC_HOOK_MEM_READ, qfprom_hook, begin=QFPROM_ADDR, end=QFPROM_ADDR + QFPROM_LEN)
-
-        # 0x00000000221C397C is also qfprom?
-        QFPROM2_ADDR = 0x221c3000
-        QFPROM2_LEN = 0x1000
-        mu.mem_map(QFPROM2_ADDR, QFPROM2_LEN, UC_PROT_READ)
-        # Knox guard fuse?
-        mu.mem_write(0x00000000221C397C, struct.pack("<I", 0))
-        mu.hook_add(UC_HOOK_MEM_READ, qfprom_hook, begin=QFPROM2_ADDR, end=QFPROM2_ADDR + QFPROM2_LEN)
-
-        # 0x00000000221C20D8 is also qfprom?
-        QFPROM3_ADDR = 0x221c2000
-        QFPROM3_LEN = 0x1000
-        mu.mem_map(QFPROM3_ADDR, QFPROM3_LEN, UC_PROT_READ)
-        mu.hook_add(UC_HOOK_MEM_READ, qfprom_hook, begin=QFPROM3_ADDR, end=QFPROM3_ADDR + QFPROM3_LEN)
-
-        def hook_zero_mem(mu: Uc, address: int, size: int, user_data):
-            x0 = mu.reg_read(UC_ARM64_REG_X0)
-            x1 = mu.reg_read(UC_ARM64_REG_X1)
-            lr = mu.reg_read(UC_ARM64_REG_LR)
-            #print(f"ZeroMem: Called from {lr:X} x0: {x0:X} x1: {x1:X}")
-            mu.mem_write(x0, bytes(x1))
-            mu.reg_write(UC_ARM64_REG_PC, 0x6f08)
-
-        mu.hook_add(UC_HOOK_CODE, hook_zero_mem, begin=0x6e6c, end=0x6e6c)
-
-        traces = [0x11644, 0x3fd4, 0x76000, 0x0008db10]
-        for trace in traces:
-            def samsung_test_hook1(mu: Uc, address: int, size: int, user_data):
-                x0 = mu.reg_read(UC_ARM64_REG_X0)
-                x1 = mu.reg_read(UC_ARM64_REG_X1)
-                x2 = mu.reg_read(UC_ARM64_REG_X2)
-                x3 = mu.reg_read(UC_ARM64_REG_X3)
-                lr = mu.reg_read(UC_ARM64_REG_LR)
-                if address == 0x0008db10:
-                    print(f"Samsung 0008db10: Called from {lr:X} x0: {read_string(mu, x0)} x1: {x1} x2: {x2} x3: {x3:X}")
-                elif address == 0x3fd4:
-                    print(f"Samsung log hook {address:X}: Called from {lr:X} x0: {x0:X} x1: {x1:X} x2: {x2:X} Fix log level")
-                    mu.reg_write(UC_ARM64_REG_X0, 0x80000042)
-                else:
-                    print(f"Samsung test hook {address:X}: Called from {lr:X} x0: {x0:X} x1: {x1:X} x2: {x2:X}")
-
-            mu.hook_add(UC_HOOK_CODE, samsung_test_hook1, begin=trace, end=trace)
-
-        mem_hook_addrs = [0x17b990, 0x0000000000132A58]
-        def samsung_mem_hook(mu: Uc, access, address, size, value, user_data):
-            pc = mu.reg_read(UC_ARM64_REG_PC)
-
-            print(f"Mem hook:")
-            print(f"    access : {access}")
-            print(f"    addr : 0x{address:X}")
-            print(f"    size: {size} B")
-            print(f"    value: 0x{value:X}")
-            print(f"    pc   : 0x{pc:X}")
-
-        for addr in mem_hook_addrs:
-            mu.hook_add(UC_HOOK_MEM_WRITE, samsung_mem_hook, begin=addr, end=addr)
-
-    def hook_getblkiohandles(mu: Uc, address: int, size: int, user_data):
-        x0 = mu.reg_read(UC_ARM64_REG_X0)  # SelectionAttrib
-        x1 = mu.reg_read(UC_ARM64_REG_X1)  # FilterData pointer
-        x2 = mu.reg_read(UC_ARM64_REG_X2)  # HandleInfoPtr pointer
-        x3 = mu.reg_read(UC_ARM64_REG_X3)  # MaxBlkIopCnt pointer
-        lr = mu.reg_read(UC_ARM64_REG_LR)  # Return address
-        
-        print(f"\n[FUNC] GetBlkIOHandles called from 0x{lr:X}")
-        print(f"       SelectionAttrib (X0): 0x{x0:X}")
-        print(f"       FilterData (X1):      0x{x1:016X}")
-        print(f"       HandleInfoPtr (X2):   0x{x2:016X}")
-        print(f"       MaxBlkIopCnt (X3):    0x{x3:016X}")
-        
-        # Try to read MaxBlkIopCnt value
-        try:
-            max_cnt = struct.unpack("<I", mu.mem_read(x3, 4))[0]
-            print(f"       *MaxBlkIopCnt (value): {max_cnt}")
-        except UcError:
-            print(f"       *MaxBlkIopCnt: <unreadable>")
-        
-        # Try to read FilterData structure if not NULL
-        if x1 != 0:
-            try:
-                # PartiSelectFilter is a structure with:
-                # - RootDeviceType (pointer to GUID)
-                # - PartitionType (pointer to GUID)
-                # - PartitionLabel (pointer to CHAR16)
-                # - VolumeName (pointer to CHAR8)
-                filter_data = mu.mem_read(x1, 32)
-                root_dev_type = struct.unpack("<Q", filter_data[0:8])[0]
-                partition_type = struct.unpack("<Q", filter_data[8:16])[0]
-                volume_name = struct.unpack("<Q", filter_data[16:24])[0]
-                partition_label = struct.unpack("<Q", filter_data[24:32])[0]
-                
-                print(f"       FilterData contents:")
-                print(f"         RootDeviceType (ptr):    0x{root_dev_type:016X}")
-                print(f"         PartitionType (ptr):     0x{partition_type:016X}")
-                print(f"         VolumeName (ptr):        0x{volume_name:016X}")
-                print(f"         PartitionLabel (ptr):    0x{partition_label:016X}")
-                
-                # Read RootDeviceType GUID if pointer is not NULL
-                if root_dev_type != 0:
-                    try:
-                        guid_bytes = bytes(mu.mem_read(root_dev_type, 16))
-                        guid_str = guid_to_str(guid_bytes)
-                        guid_name = known_guid(guid_str)
-                        print(f"           RootDeviceType GUID: {guid_name}")
-                    except UcError:
-                        print(f"           RootDeviceType GUID: <unreadable at 0x{root_dev_type:016X}>")
-                
-                # Read PartitionType GUID if pointer is not NULL
-                if partition_type != 0:
-                    try:
-                        guid_bytes = bytes(mu.mem_read(partition_type, 16))
-                        guid_str = guid_to_str(guid_bytes)
-                        guid_name = known_guid(guid_str)
-                        print(f"           PartitionType GUID: {guid_name}")
-                    except UcError:
-                        print(f"           PartitionType GUID: <unreadable at 0x{partition_type:016X}>")
-                
-                # Read PartitionLabel string if pointer is not NULL (wide string)
-                if partition_label != 0:
-                    try:
-                        label_bytes = bytearray()
-                        for i in range(0, 256, 2):
-                            c1, c2 = struct.unpack("BB", mu.mem_read(partition_label + i, 2))
-                            if c1 == 0 and c2 == 0:
-                                break
-                            if c2 == 0 and 0x20 <= c1 <= 0x7E:
-                                label_bytes.append(c1)
-                            else:
-                                break
-                        if label_bytes:
-                            print(f"           PartitionLabel: '{label_bytes.decode('ascii', errors='ignore')}'")
-                    except UcError:
-                        print(f"           PartitionLabel: <unreadable at 0x{partition_label:016X}>")
-                
-                # Read VolumeName string if pointer is not NULL (ASCII string)
-                if volume_name != 0:
-                    try:
-                        vol_bytes = bytearray()
-                        for i in range(256):
-                            c = mu.mem_read(volume_name + i, 1)[0]
-                            if c == 0:
-                                break
-                            if 0x20 <= c <= 0x7E:
-                                vol_bytes.append(c)
-                            else:
-                                break
-                        if vol_bytes:
-                            print(f"           VolumeName: '{vol_bytes.decode('ascii', errors='ignore')}'")
-                    except UcError:
-                        print(f"           VolumeName: <unreadable at 0x{volume_name:016X}>")
-            except UcError:
-                print(f"       FilterData: <unreadable>")
-
-    if args.legacy_hooks:
-        getblkiohandles_addr = image_base + (0x11a5c if args.fix == defines.FIX_SAMSUNG else 0xADB4)
-        mu.hook_add(UC_HOOK_CODE, hook_getblkiohandles, begin=getblkiohandles_addr, end=getblkiohandles_addr)
-    #mu.hook_add(UC_HOOK_CODE, hook_log_15ec, begin=image_base + 0x15EC, end=image_base + 0x15EC)
-
-    #mu.hook_add(UC_HOOK_CODE, hook_code, begin=STRNCMP_ADDR, end=STRNCMP_ADDR)
-
     if args.dump_dir is not None:
         dump_dir = Path(args.dump_dir)
         captured = False
@@ -1583,7 +1392,6 @@ def main():
     # Dies at: 1ca93ac: d5181000      msr     SCTLR_EL1, x0
     mu.hook_add(UC_HOOK_CODE, hook_kernel, begin=defines.KERNEL_BASE, end=defines.KERNEL_BASE + defines.KERNEL_SIZE)
 
-    set_simple_hook(mu, 0xe4c0, lambda mu, address, size, user_data: print(f"0x{address:x}: Compare {mu.reg_read(UC_ARM64_REG_X8).to_bytes(4, 'little').decode('utf-8', errors='ignore')} {mu.reg_read(UC_ARM64_REG_X10).to_bytes(4, 'little').decode('utf-8', errors='ignore')}"))
 
     # -----------------------------------------------------------------------
     # 9. Initialize debugging (breakpoints from environment variable)

@@ -84,7 +84,7 @@ $ python emu.py abl.elf --feed-cmd "getvar:all" --reset-reason 2 | grep -ai usb
 ...
 ```
 
-Tested on Y700 gen4 TB322FC (ZUXOS_1.5.10.063_260111_PRC). emu.py currently embeds some addresses for Y700 gen4 to log internal behaviors, but it is not neccessary for emulation.
+Verified with the OnePlus 15 (infiniti, sm8850) LinuxLoader.efi and the device's own partition captures.
 
 Also run against OnePlus 15 (infiniti, sm8850) `LinuxLoader.efi` with the device's
 own `boot_b`/`vendor_boot_b`/`init_boot_b`/`recovery_b` captures: the ABL resolves
@@ -124,9 +124,7 @@ python emu.py LinuxLoader.efi \
 ```
 
 `--partitions-json FILE` takes the same list as JSON. When no partition set is
-given the historical `samsung-imgs/` layout is used, and `--legacy-hooks`
-enables the device-specific code hooks that are only meaningful for the
-originally reverse-engineered targets.
+given a built-in demo layout is used.
 
 The QCOM ABL partition-entry interface reports the **slot-less** label (`boot`,
 not `boot_b`): the ABL appends `_a`/`_b` from the selected slot itself and

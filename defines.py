@@ -71,6 +71,3 @@ EfiHashAlgorithmSha256                 = "51AA59DE-FDF2-4EA3-BC63-875FB7842EE9"
 EfiHashAlgorithmSha224                 = "8DF01A06-9BD5-4BF7-B021-DB4FD9CCF45B"
 EfiHashAlgorithmSha1                   = "2AE9D80F-3FB2-4095-B7B1-E93157B946B6"
 
-FIX_NONE = 0
-FIX_SAMSUNG = 1
-

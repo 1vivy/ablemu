@@ -133,11 +133,8 @@ class PartitionList:
 
     def _default_partitions(self, d):
         return [
-            #{"partition_name": "frp", "path": "frp.img"},
-            #{"partition_name": "devinfo", "path": "devinfo.img"},
             {"partition_name": "boot_a", "path": d + "boot.img"},
             {"partition_name": "boot_b", "path": d + "boot.img"},
-            #{"partition_name": "system_a", "path": d + "system.img"},
             {"partition_name": "abl_a", "path": d + "abl.elf"},
             {"partition_name": "abl_b", "path": d + "abl.elf"},
             {"partition_name": "dtbo_a", "path": d + "dtbo.img"},
@@ -148,8 +145,6 @@ class PartitionList:
             {"partition_name": "vendor_boot_b", "path": d + "vendor_boot.img"},
             {"partition_name": "vbmeta_system_a", "path": d + "vbmeta_system.img"},
             {"partition_name": "vbmeta_system_b", "path": d + "vbmeta_system.img"},
-            # {"partition_name": "recovery_a", "path": d + "recovery.img"},
-            # {"partition_name": "recovery_b", "path": d + "recovery.img"},
             {"partition_name": "init_boot_a", "path": d + "init_boot.img"},
             {"partition_name": "init_boot_b", "path": d + "init_boot.img"},
             {"partition_name": "xbl_a", "path": d + "xbl.img"},
@@ -159,7 +154,7 @@ class PartitionList:
             {"partition_name": "efisp", "path": "abl.pe"},
         ]
 
-    def setup(self, fix):
+    def setup(self):
         d = DEFAULT_IMAGES_DIR
         if self.entries is not None:
             self.partition_list = [
@@ -168,14 +163,6 @@ class PartitionList:
             ]
         else:
             self.partition_list = self._default_partitions(d)
-        if fix == defines.FIX_SAMSUNG:
-            self.partition_list.append({"partition_name": "param", "path": d + "param.img"})
-            self.partition_list.append({"partition_name": "debug", "path": d + "debug.img"})
-            self.partition_list.append({"partition_name": "optics_a", "path": d + "optics.img"})
-            self.partition_list.append({"partition_name": "optics_b", "path": d + "optics.img"})
-            self.partition_list.append({"partition_name": "prism_a", "path": d + "prism.img"})
-            self.partition_list.append({"partition_name": "prism_b", "path": d + "prism.img"})
-            self.partition_list.append({"partition_name": "btd", "path": d + "btd.img"})
 
         current_lba = 0
         for partition in self.partition_list:
